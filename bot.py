@@ -62,6 +62,17 @@ def format_days_summary(days_csv: str) -> str:
     return "، ".join(DAY_NAME_BY_VALUE[d] for d in tokens)
 
 
+def get_alt_cycle_start_text(created_at_iso: Optional[str]) -> str:
+    """Return human-readable text for alternate day cycle start."""
+    if not created_at_iso:
+        return "من اليوم"
+    try:
+        start_date = dt.datetime.fromisoformat(created_at_iso).date()
+        return f"يبدأ من {start_date.strftime('%d/%m/%Y')}"
+    except Exception:
+        return "من اليوم"
+
+
 def is_every_other_day_active(created_at_iso: Optional[str], target_date: dt.date) -> bool:
     """Return True when target_date matches the alternating-day cycle start."""
     if not created_at_iso:
@@ -898,10 +909,11 @@ bot = ReminderBot()
 
 
 class DaysSelectView(discord.ui.View):
-    def __init__(self, callback, owner_id: int):
+    def __init__(self, callback, owner_id: int, include_alt_start: bool = False):
         super().__init__(timeout=300)
         self.callback = callback
         self.owner_id = owner_id
+        self.include_alt_start = include_alt_start
         
         select = discord.ui.Select(
             placeholder="Select days",
@@ -933,10 +945,41 @@ class DaysSelectView(discord.ui.View):
         if "all" in values:
             days = "0,1,2,3,4,5,6"
         elif "alt" in values:
+            # If alt is selected, ask when to start the cycle
+            if self.include_alt_start:
+                await interaction.response.send_message(
+                    "اختر بداية دورة يوم إيه / يوم لا:",
+                    view=AltStartSelectView(self.callback, self.owner_id, "alt"),
+                    ephemeral=True,
+                )
+                return
             days = "alt"
         else:
             days = ",".join(sorted(values, key=int))
         await self.callback(interaction, days)
+
+
+class AltStartSelectView(discord.ui.View):
+    def __init__(self, callback, owner_id: int, days_value: str):
+        super().__init__(timeout=300)
+        self.callback = callback
+        self.owner_id = owner_id
+        self.days = days_value
+
+    @discord.ui.button(label="ابدأ من اليوم | Start Today", style=discord.ButtonStyle.primary)
+    async def start_today(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Not for you.", ephemeral=True)
+            return
+        await self.callback(interaction, self.days)
+
+    @discord.ui.button(label="ابدأ من الغد | Start Tomorrow", style=discord.ButtonStyle.secondary)
+    async def start_tomorrow(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Not for you.", ephemeral=True)
+            return
+        # Pass special marker to indicate starting from tomorrow
+        await self.callback(interaction, f"{self.days}!tomorrow")
 
 
 class ReminderMinutesSelectView(discord.ui.View):
@@ -1141,6 +1184,16 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
             )
 
         async def finalize_create(inter: discord.Interaction) -> None:
+            # Handle the alt start date marker
+            created_at_value = None
+            clean_days = self.selected_days
+            
+            if "!tomorrow" in self.selected_days:
+                # User chose to start from tomorrow
+                tomorrow = dt.datetime.now().date() + dt.timedelta(days=1)
+                created_at_value = dt.datetime.combine(tomorrow, dt.time()).isoformat()
+                clean_days = self.selected_days.replace("!tomorrow", "")
+            
             conn = get_conn()
             try:
                 cursor = conn.execute(
@@ -1156,12 +1209,12 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
                         interaction.user.id,
                         self.title_input.value.strip(),
                         self.selected_time,
-                        self.selected_days,
+                        clean_days,
                         int(self.selected_remind_before),
                         None,
                         self.selected_image_url,
                         self.selected_channel_id,
-                        dt.datetime.now().isoformat(),
+                        created_at_value or dt.datetime.now().isoformat(),
                     ),
                 )
                 conn.commit()
@@ -1176,7 +1229,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
 
         await interaction.response.send_message(
             content="Select days for the reminder:",
-            view=DaysSelectView(on_days_selected, interaction.user.id),
+            view=DaysSelectView(on_days_selected, interaction.user.id, include_alt_start=True),
             ephemeral=True,
         )
 
@@ -2670,35 +2723,366 @@ class MainPanelView(discord.ui.View):
 
     @discord.ui.button(label="عرض تذكيراتي | List", style=discord.ButtonStyle.secondary)
     async def list_reminders(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        legacy_view = ControlPanelView(owner_id=self.owner_id)
-        await legacy_view.list_events(interaction, None)
-
-    @discord.ui.button(label="تعديل تذكير | Edit", style=discord.ButtonStyle.primary)
-    async def edit_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        legacy_view = ControlPanelView(owner_id=self.owner_id)
-        await legacy_view.edit_message(interaction, None)
-
-    @discord.ui.button(label="حذف تذكير | Delete", style=discord.ButtonStyle.danger)
-    async def delete_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        legacy_view = ControlPanelView(owner_id=self.owner_id)
-        await legacy_view.delete_event(interaction, None)
-
-    @discord.ui.button(label="إعدادات السيرفر | Server Settings", style=discord.ButtonStyle.secondary)
-    async def server_register(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
 
-        if not is_bot_owner(interaction.user.id):
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM events WHERE creator_id = ? AND guild_id = ? ORDER BY time ASC",
+                (interaction.user.id, interaction.guild.id),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.response.send_message("لا توجد تذكيرات.", ephemeral=True)
+            return
+
+        lines = ["تذكيراتك القادمة:"]
+        for row in rows[:20]:
+            days_str = format_days_summary(str(row["days"] or ""))
+            channel_str = f"<#{row['channel_id']}>" if row["channel_id"] else "Default"
+            lines.append(
+                f"• ID {row['id']} | {row['title']} | {row['time']} | -{row['remind_before_minutes']}m | {days_str} | {channel_str}"
+            )
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="تعديل تذكير | Edit", style=discord.ButtonStyle.primary)
+    async def edit_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, title, time, days, remind_before_minutes, message, image_url, channel_id FROM events WHERE creator_id = ? AND guild_id = ? ORDER BY time ASC",
+                (interaction.user.id, interaction.guild.id),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.response.send_message("لا توجد تذكيرات.", ephemeral=True)
+            return
+
+        class EventActionView(discord.ui.View):
+            def __init__(self, owner_id: int, event_row: sqlite3.Row, event_rows):
+                super().__init__(timeout=300)
+                self.owner_id = owner_id
+                self.event_row = event_row
+                self.event_rows = event_rows
+
+            async def interaction_check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != self.owner_id:
+                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    return False
+                return True
+
+            @discord.ui.button(label="تعديل الوقت والأيام | Time", style=discord.ButtonStyle.primary)
+            async def edit_time_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.send_modal(
+                    EditScheduleModal(
+                        event_id=self.event_row["id"],
+                        current_title=self.event_row["title"],
+                        current_time=self.event_row["time"],
+                        current_days=self.event_row["days"],
+                        current_remind_before=int(self.event_row["remind_before_minutes"]),
+                    )
+                )
+
+            @discord.ui.button(label="تعديل الرسالة | Message", style=discord.ButtonStyle.success)
+            async def edit_message_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.send_modal(
+                    EditMessageModal(self.event_row["id"], self.event_row["message"])
+                )
+
+            @discord.ui.button(label="رفع صورة | Image", style=discord.ButtonStyle.secondary)
+            async def upload_image_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.send_message(
+                    "أرسل الصورة كمرفق في نفس القناة خلال 60 ثانية.",
+                    ephemeral=True,
+                )
+
+                if not inter.channel:
+                    await inter.followup.send("لا يمكن رفع صورة هنا.", ephemeral=True)
+                    return
+
+                def check(msg: discord.Message) -> bool:
+                    return (
+                        msg.author.id == self.owner_id
+                        and msg.channel.id == inter.channel.id
+                        and len(msg.attachments) > 0
+                    )
+
+                try:
+                    msg = await bot.wait_for("message", timeout=60, check=check)
+                except asyncio.TimeoutError:
+                    await inter.followup.send("انتهى الوقت.", ephemeral=True)
+                    return
+
+                attachment = msg.attachments[0]
+                if not is_image_attachment(attachment):
+                    await inter.followup.send("ليست صورة.", ephemeral=True)
+                    return
+
+                class ConfirmImageView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=60)
+
+                    @discord.ui.button(label="✅ تأكيد | Confirm", style=discord.ButtonStyle.success)
+                    async def confirm_image(self, conf_inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                        if conf_inter.user.id != self.owner_id:
+                            await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                            return
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE events SET image_url = ? WHERE id = ? AND creator_id = ?",
+                                (attachment.url, self.event_row["id"], self.owner_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                        await conf_inter.response.edit_message(content="✅ تم حفظ الصورة.", view=None)
+
+                    @discord.ui.button(label="❌ إلغاء | Cancel", style=discord.ButtonStyle.danger)
+                    async def cancel_image(self, conf_inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                        if conf_inter.user.id != self.owner_id:
+                            await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                            return
+                        await conf_inter.response.edit_message(content="تم إلغاء الرفع.", view=None)
+
+                await inter.followup.send(
+                    f"📸 تم اختيار: {attachment.filename}",
+                    view=ConfirmImageView(),
+                    ephemeral=True,
+                )
+
+            @discord.ui.button(label="تعديل القناة | Channel", style=discord.ButtonStyle.primary)
+            async def edit_channel_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild:
+                    await inter.response.send_message("Server only.", ephemeral=True)
+                    return
+
+                text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
+
+                class EventChannelSelect(discord.ui.Select):
+                    def __init__(self):
+                        options = [
+                            discord.SelectOption(label="القناة الافتراضية | Default", value="default")
+                        ]
+                        options.extend(
+                            discord.SelectOption(label=f"#{ch.name}"[:100], value=str(ch.id))
+                            for ch in text_channels[:24]
+                        )
+                        super().__init__(
+                            placeholder="اختر القناة",
+                            options=options,
+                            min_values=1,
+                            max_values=1,
+                        )
+
+                    async def callback(self, sel_inter: discord.Interaction) -> None:
+                        if sel_inter.user.id != self.owner_id:
+                            await sel_inter.response.send_message("Not for you.", ephemeral=True)
+                            return
+
+                        selected = self.values[0]
+                        new_channel_id = None if selected == "default" else int(selected)
+
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE events SET channel_id = ? WHERE id = ? AND creator_id = ?",
+                                (new_channel_id, self.event_row["id"], self.owner_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+
+                        channel_label = f"<#{new_channel_id}>" if new_channel_id else "Default"
+                        await sel_inter.response.edit_message(
+                            content=f"✅ تم التحديث.\nChannel: {channel_label}",
+                            view=None,
+                        )
+
+                class EventChannelSelectView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=300)
+                        self.add_item(EventChannelSelect())
+
+                await inter.response.edit_message(
+                    content="اختر القناة:",
+                    view=EventChannelSelectView(),
+                )
+
+            @discord.ui.button(label="حذف | Delete", style=discord.ButtonStyle.danger)
+            async def delete_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                conn2 = get_conn()
+                try:
+                    conn2.execute(
+                        "DELETE FROM events WHERE id = ? AND creator_id = ?",
+                        (self.event_row["id"], self.owner_id),
+                    )
+                    conn2.commit()
+                finally:
+                    conn2.close()
+
+                await inter.response.edit_message(
+                    content="✅ تم الحذف.",
+                    view=None,
+                )
+
+            @discord.ui.button(label="رجوع | Back", style=discord.ButtonStyle.secondary)
+            async def back_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.edit_message(
+                    content="اختر التذكير:",
+                    view=EventPickerView(self.owner_id, self.event_rows),
+                )
+
+        class EventPickerView(discord.ui.View):
+            def __init__(self, owner_id: int, event_rows):
+                super().__init__(timeout=300)
+                self.owner_id = owner_id
+
+                for row in event_rows[:25]:
+                    label = f"{row['title'][:35]} | {row['time']}"
+                    btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
+
+                    async def on_pick(pick_inter: discord.Interaction, selected=row) -> None:
+                        if pick_inter.user.id != self.owner_id:
+                            await pick_inter.response.send_message("Not for you.", ephemeral=True)
+                            return
+
+                        days_str = format_days_summary(selected["days"])
+                        channel_str = f"<#{selected['channel_id']}>" if selected["channel_id"] else "Default"
+                        summary = (
+                            f"ID {selected['id']}\n"
+                            f"{selected['title']}\n"
+                            f"⏰ {selected['time']} | -{selected['remind_before_minutes']}m\n"
+                            f"📅 {days_str}\n"
+                            f"💬 {channel_str}"
+                        )
+                        await pick_inter.response.edit_message(
+                            content=summary,
+                            view=EventActionView(self.owner_id, selected, event_rows),
+                        )
+
+                    btn.callback = on_pick
+                    self.add_item(btn)
+
+        await interaction.response.send_message(
+            "اختر التذكير:",
+            view=EventPickerView(interaction.user.id, rows),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="حذف تذكير | Delete", style=discord.ButtonStyle.danger)
+    async def delete_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, title FROM events WHERE creator_id = ? AND guild_id = ?",
+                (interaction.user.id, interaction.guild.id),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.response.send_message("لا توجد تذكيرات.", ephemeral=True)
+            return
+
+        class DeleteView(discord.ui.View):
+            def __init__(self, parent_user_id: int):
+                super().__init__(timeout=300)
+                self.parent_user_id = parent_user_id
+
+            async def interaction_check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != self.parent_user_id:
+                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    return False
+                return True
+
+            def _build_buttons(self, rows_data) -> None:
+                for row in rows_data[:25]:
+                    def make_delete(event_id: int):
+                        async def delete_callback(inter: discord.Interaction) -> None:
+                            conn2 = get_conn()
+                            try:
+                                conn2.execute(
+                                    "DELETE FROM events WHERE id = ? AND creator_id = ?",
+                                    (event_id, self.parent_user_id),
+                                )
+                                conn2.commit()
+                            finally:
+                                conn2.close()
+                            await inter.response.send_message("✅ تم الحذف.", ephemeral=True)
+                        return delete_callback
+
+                    btn = discord.ui.Button(
+                        label=f"🗑 {row['title'][:22]}",
+                        style=discord.ButtonStyle.danger,
+                    )
+                    btn.callback = make_delete(row["id"])
+                    self.add_item(btn)
+
+        dv = DeleteView(interaction.user.id)
+        dv._build_buttons(rows)
+
+        await interaction.response.send_message(
+            "اختر التذكير للحذف:",
+            view=dv,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="إعدادات ServerServer | Config", style=discord.ButtonStyle.secondary)
+    async def server_config(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT notification_channel_id FROM server_settings WHERE guild_id = ?",
+                (interaction.guild.id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row or not row["notification_channel_id"]:
             await interaction.response.send_message(
-                "هذه الإعدادات متاحة فقط لمالك البوت.",
+                "السيرفر غير مسجل. استخدم `/setup`.",
                 ephemeral=True,
             )
             return
 
+        channel_id = row["notification_channel_id"]
+
+        class ServerConfigView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=300)
+
+            @discord.ui.button(label="عرض الإعدادات | View", style=discord.ButtonStyle.secondary)
+            async def view_config(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.send_message(
+                    f"⚙️ إعدادات السيرفر:\n"
+                    f"معرّف السيرفر: `{interaction.guild.id}`\n"
+                    f"قناة التذكيرات: <#{channel_id}>",
+                    ephemeral=True,
+                )
+
         await interaction.response.send_message(
-            "لوحة إعدادات السيرفر (للمالك فقط):",
-            view=OwnerServerSettingsView(interaction.user.id, interaction.guild.id),
+            "إعدادات السيرفر:",
+            view=ServerConfigView(),
             ephemeral=True,
         )
 
