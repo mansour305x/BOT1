@@ -1,2 +1,3 @@
-discord.py>=2.4.0
-python-dotenv>=1.0.1
+# الحزمة الصحيحة هي discord.py وليس discord
+discord.py==2.7.1
+python-dotenv==1.2.2

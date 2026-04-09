@@ -5,9 +5,7 @@ import os
 import re
 import sqlite3
 import sys
-from dataclasses import dataclass
-from typing import Optional, Set
-from zoneinfo import ZoneInfo
+from typing import Optional
 
 import discord
 from discord import app_commands
