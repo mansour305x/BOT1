@@ -1417,6 +1417,32 @@ class ControlPanelView(discord.ui.View):
                 self.parent_user_id = parent_user_id
                 self.parent_guild_id = parent_guild_id
 
+            @discord.ui.button(label="View Registered | عرض المسجل", style=discord.ButtonStyle.secondary)
+            async def view_registered(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                conn = get_conn()
+                try:
+                    rows = conn.execute(
+                        "SELECT guild_id, notification_channel_id FROM server_settings ORDER BY guild_id ASC"
+                    ).fetchall()
+                finally:
+                    conn.close()
+
+                if not rows:
+                    await inter.response.send_message("لا يوجد أي سيرفر مسجل حالياً.", ephemeral=True)
+                    return
+
+                lines = ["السيرفرات المسجلة:"]
+                for row in rows[:20]:
+                    gid = row["guild_id"]
+                    channel_text = f"<#{row['notification_channel_id']}>" if row["notification_channel_id"] else "غير محددة"
+                    marker = " (هذا السيرفر)" if gid == self.parent_guild_id else ""
+                    lines.append(f"- {gid}{marker} | قناة التذكير: {channel_text}")
+
+                if len(rows) > 20:
+                    lines.append(f"... +{len(rows) - 20} more")
+
+                await inter.response.send_message("\n".join(lines), ephemeral=True)
+
             @discord.ui.button(label="Add Admin | إضافة مشرف", style=discord.ButtonStyle.secondary)
             async def add_admin(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 class AdminModal(discord.ui.Modal, title="Add Admin"):
@@ -1481,6 +1507,32 @@ class ControlPanelView(discord.ui.View):
                         await modal_inter.response.defer(ephemeral=True, thinking=True)
 
                         guild_id = int(raw)
+
+                        conn = get_conn()
+                        try:
+                            existing = conn.execute(
+                                "SELECT notification_channel_id FROM server_settings WHERE guild_id = ?",
+                                (guild_id,),
+                            ).fetchone()
+                        finally:
+                            conn.close()
+
+                        if existing:
+                            channel_text = (
+                                f"<#{existing['notification_channel_id']}>"
+                                if existing["notification_channel_id"]
+                                else "غير محددة"
+                            )
+                            await modal_inter.followup.send(
+                                (
+                                    "هذا السيرفر مسجل مسبقاً، لا يمكن تسجيله مرة ثانية.\n"
+                                    f"Server ID: **{guild_id}**\n"
+                                    f"Reminder Channel: {channel_text}"
+                                ),
+                                ephemeral=True,
+                            )
+                            return
+
                         try:
                             target_guild = await bot.fetch_guild(guild_id)
                             channels = await target_guild.fetch_channels()
