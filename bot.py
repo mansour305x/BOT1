@@ -2929,7 +2929,10 @@ class OwnerAdvancedView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id or not is_bot_owner(interaction.user.id):
-            await interaction.response.send_message("هذه اللوحة لمالك البوت فقط.", ephemeral=True)
+            await interaction.response.send_message(
+                bi_text("هذه اللوحة لمالك البوت فقط.", "This panel is for bot owner only."),
+                ephemeral=True,
+            )
             return False
         return True
 
