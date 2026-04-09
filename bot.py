@@ -1123,6 +1123,69 @@ class ControlPanelView(discord.ui.View):
 
                 await inter.followup.send("تم تحديث الصورة بنجاح.", ephemeral=True)
 
+            @discord.ui.button(label="Edit Channel | تعديل القناة", style=discord.ButtonStyle.primary)
+            async def edit_channel_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild:
+                    await inter.response.send_message("Server only.", ephemeral=True)
+                    return
+
+                text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
+
+                class EventChannelSelect(discord.ui.Select):
+                    def __init__(self):
+                        options = [
+                            discord.SelectOption(
+                                label="Use server default channel | استخدم القناة الافتراضية",
+                                value="default",
+                            )
+                        ]
+                        options.extend(
+                            discord.SelectOption(label=f"#{ch.name}"[:100], value=str(ch.id))
+                            for ch in text_channels[:24]
+                        )
+                        super().__init__(
+                            placeholder="Select new channel for this reminder",
+                            options=options,
+                            min_values=1,
+                            max_values=1,
+                        )
+
+                    async def callback(self, select_inter: discord.Interaction) -> None:
+                        if select_inter.user.id != self.view.owner_id:
+                            await select_inter.response.send_message("Not for you.", ephemeral=True)
+                            return
+
+                        selected = self.values[0]
+                        new_channel_id = None if selected == "default" else int(selected)
+
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE events SET channel_id = ? WHERE id = ? AND creator_id = ?",
+                                (new_channel_id, self.view.event_id, self.view.owner_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+
+                        channel_label = f"<#{new_channel_id}>" if new_channel_id else "Default"
+                        await select_inter.response.edit_message(
+                            content=f"تم تحديث قناة التذكير بنجاح.\nChannel: {channel_label}",
+                            view=None,
+                        )
+
+                class EventChannelSelectView(discord.ui.View):
+                    def __init__(self, owner_id: int, event_id: int):
+                        super().__init__(timeout=300)
+                        self.owner_id = owner_id
+                        self.event_id = event_id
+                        self.add_item(EventChannelSelect())
+
+                await inter.response.edit_message(
+                    content="اختر القناة الجديدة لهذا التذكير (أو القناة الافتراضية):",
+                    view=EventChannelSelectView(self.owner_id, self.event_row["id"]),
+                )
+
             @discord.ui.button(label="Delete | حذف", style=discord.ButtonStyle.danger)
             async def delete_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 conn2 = get_conn()
