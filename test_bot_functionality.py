@@ -28,6 +28,7 @@ def test_format_days_summary():
     assert "الاثنين" in bot.format_days_summary("0"), "Monday value should return correct Arabic name"
     summary = bot.format_days_summary("0,4")
     assert "الاثنين" in summary and "الجمعة" in summary, "Multiple days summary failed"
+    assert bot.format_days_summary("alt") == "يوم إيه / يوم لا", "Alternate days label should be supported"
     assert bot.format_days_summary("") == "-", "Empty days should return '-'"
     print("✓ format_days_summary works")
 
@@ -120,7 +121,7 @@ def test_database_schema():
         expected = {
             "id", "guild_id", "creator_id", "title", "time",
             "days", "remind_before_minutes", "message", "image_url",
-            "last_sent_marker", "created_at",
+            "last_sent_marker", "channel_id", "created_at",
         }
         assert expected.issubset(columns), f"Missing columns: {expected - columns}"
     finally:

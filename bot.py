@@ -44,12 +44,25 @@ DAY_NAME_BY_VALUE = {
 
 
 def format_days_summary(days_csv: str) -> str:
+    if days_csv == "alt":
+        return "يوم إيه / يوم لا"
     tokens = [d for d in days_csv.split(",") if d in DAY_NAME_BY_VALUE]
     if tokens == ["0", "1", "2", "3", "4", "5", "6"]:
         return "كل الأيام"
     if not tokens:
         return "-"
     return "، ".join(DAY_NAME_BY_VALUE[d] for d in tokens)
+
+
+def is_every_other_day_active(created_at_iso: Optional[str], target_date: dt.date) -> bool:
+    """Return True when target_date matches the alternating-day cycle start."""
+    if not created_at_iso:
+        return True
+    try:
+        start_date = dt.datetime.fromisoformat(created_at_iso).date()
+    except Exception:
+        return True
+    return (target_date - start_date).days % 2 == 0
 
 MESSAGES = {
     "en": {
@@ -131,6 +144,8 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("ALTER TABLE events ADD COLUMN remind_before_minutes INTEGER NOT NULL DEFAULT 10")
     if "last_sent_marker" not in columns:
         conn.execute("ALTER TABLE events ADD COLUMN last_sent_marker TEXT")
+    if "channel_id" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN channel_id INTEGER")
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -445,46 +460,51 @@ class ReminderBot(commands.Bot):
 
     @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
     async def reminder_loop(self) -> None:
-        now = dt.datetime.now()
-        current_day = now.weekday()
-        current_minutes = now.hour * 60 + now.minute
+        now = dt.datetime.now().replace(second=0, microsecond=0)
         current_marker = now.strftime("%Y-%m-%d %H:%M")
 
         conn = get_conn()
         try:
             rows = conn.execute("SELECT * FROM events").fetchall()
             for row in rows:
-                days_set = {int(d) for d in str(row["days"]).split(",") if d != ""}
-                if not days_set:
-                    continue
-
                 try:
                     event_hour, event_minute = map(int, row["time"].split(":"))
                 except Exception:
                     continue
 
                 remind_before = int(row["remind_before_minutes"] or 10)
-                event_total = event_hour * 60 + event_minute
 
-                for event_day in days_set:
-                    trigger_total = event_total - remind_before
-                    trigger_day = event_day
-                    if trigger_total < 0:
-                        trigger_total += 24 * 60
-                        trigger_day = (event_day - 1) % 7
+                days_raw = str(row["days"] or "")
 
-                    if trigger_day != current_day or trigger_total != current_minutes:
+                def date_is_active(target_date: dt.date) -> bool:
+                    if days_raw == "alt":
+                        return is_every_other_day_active(row["created_at"], target_date)
+                    day_tokens = {int(d) for d in days_raw.split(",") if d.isdigit()}
+                    return target_date.weekday() in day_tokens
+
+                should_send = False
+                for offset_days in (0, 1):
+                    event_date = now.date() + dt.timedelta(days=offset_days)
+                    if not date_is_active(event_date):
                         continue
 
-                    if row["last_sent_marker"] == current_marker:
-                        continue
+                    event_dt = dt.datetime.combine(event_date, dt.time(hour=event_hour, minute=event_minute))
+                    trigger_dt = event_dt - dt.timedelta(minutes=remind_before)
+                    if trigger_dt == now:
+                        should_send = True
+                        break
 
-                    await self.send_event_reminder(row)
-                    conn.execute(
-                        "UPDATE events SET last_sent_marker = ? WHERE id = ?",
-                        (current_marker, row["id"]),
-                    )
-                    break
+                if not should_send:
+                    continue
+
+                if row["last_sent_marker"] == current_marker:
+                    continue
+
+                await self.send_event_reminder(row)
+                conn.execute(
+                    "UPDATE events SET last_sent_marker = ? WHERE id = ?",
+                    (current_marker, row["id"]),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -524,7 +544,9 @@ class ReminderBot(commands.Bot):
         mention = "@everyone"
 
         channel = None
-        if settings and settings["notification_channel_id"]:
+        if row["channel_id"]:
+            channel = guild.get_channel(int(row["channel_id"]))
+        if channel is None and settings and settings["notification_channel_id"]:
             channel = guild.get_channel(settings["notification_channel_id"])
         if channel is None:
             channel = guild.text_channels[0] if guild.text_channels else None
@@ -549,6 +571,7 @@ class DaysSelectView(discord.ui.View):
             placeholder="Select days",
             options=[
                 discord.SelectOption(label="Every Day | كل الأيام", value="all"),
+                discord.SelectOption(label="Every Other Day | يوم إيه / يوم لا", value="alt"),
                 discord.SelectOption(label="Sunday | الأحد", value="6"),
                 discord.SelectOption(label="Monday | الاثنين", value="0"),
                 discord.SelectOption(label="Tuesday | الثلاثاء", value="1"),
@@ -573,6 +596,8 @@ class DaysSelectView(discord.ui.View):
         values = interaction.data["values"]
         if "all" in values:
             days = "0,1,2,3,4,5,6"
+        elif "alt" in values:
+            days = "alt"
         else:
             days = ",".join(sorted(values, key=int))
         await self.callback(interaction, days)
@@ -622,6 +647,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
         self.selected_remind_before = None
         self.selected_days = None
         self.selected_image_url = None
+        self.selected_channel_id = None
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
@@ -698,7 +724,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
 
         async def on_reminder_selected(inter: discord.Interaction, minutes: int) -> None:
             self.selected_remind_before = minutes
-            await show_summary(inter)
+            await show_channel_selector(inter)
 
         async def on_days_selected(inter: discord.Interaction, days: str) -> None:
             self.selected_days = days
@@ -710,14 +736,66 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
                 view=ReminderMinutesSelectView(on_reminder_selected, interaction.user.id),
             )
 
+        async def show_channel_selector(inter: discord.Interaction) -> None:
+            if not interaction.guild:
+                await show_summary(inter)
+                return
+
+            text_channels = sorted(interaction.guild.text_channels, key=lambda c: c.position)
+            modal_state = self
+
+            class EventChannelSelect(discord.ui.Select):
+                def __init__(self):
+                    options = [
+                        discord.SelectOption(
+                            label="Use server default channel | استخدم القناة الافتراضية",
+                            value="default",
+                        )
+                    ]
+                    options.extend(
+                        discord.SelectOption(label=f"#{ch.name}"[:100], value=str(ch.id))
+                        for ch in text_channels[:24]
+                    )
+                    super().__init__(
+                        placeholder="Select channel for this reminder | اختر قناة هذا التذكير",
+                        options=options,
+                        min_values=1,
+                        max_values=1,
+                    )
+
+                async def callback(self, select_inter: discord.Interaction) -> None:
+                    if select_inter.user.id != interaction.user.id:
+                        await select_inter.response.send_message("Not for you.", ephemeral=True)
+                        return
+
+                    selected = self.values[0]
+                    self.view.selected_channel_id = None if selected == "default" else int(selected)
+                    modal_state.selected_channel_id = self.view.selected_channel_id
+                    await show_summary(select_inter)
+
+            class EventChannelSelectView(discord.ui.View):
+                def __init__(self):
+                    super().__init__(timeout=300)
+                    self.selected_channel_id = None
+                    self.add_item(EventChannelSelect())
+
+            await inter.response.edit_message(
+                content="اختر قناة هذا التذكير (أو اتركها على القناة الافتراضية):",
+                view=EventChannelSelectView(),
+            )
+
         async def show_summary(inter: discord.Interaction) -> None:
             image_status = self.selected_image_url if self.selected_image_url else "No image"
+            channel_status = (
+                f"<#{self.selected_channel_id}>" if self.selected_channel_id else "Default server channel"
+            )
             summary = (
                 "Summary | الملخص\n"
                 f"- Title | العنوان: {self.title_input.value.strip()}\n"
                 f"- Event Time | وقت الفعالية: {self.selected_time}\n"
                 f"- Days | الأيام: {format_days_summary(self.selected_days)}\n"
                 f"- Reminder Before | التذكير قبل: {self.selected_remind_before} دقيقة\n"
+                f"- Channel | القناة: {channel_status}\n"
                 f"- Image | الصورة: {image_status}"
             )
             await inter.response.edit_message(
@@ -732,9 +810,9 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
                     """
                     INSERT INTO events (
                         guild_id, creator_id, title, time, days,
-                        remind_before_minutes, message, image_url, created_at
+                        remind_before_minutes, message, image_url, channel_id, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         interaction.guild.id,
@@ -745,6 +823,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
                         int(self.selected_remind_before),
                         None,
                         self.selected_image_url,
+                        self.selected_channel_id,
                         dt.datetime.now().isoformat(),
                     ),
                 )
@@ -937,10 +1016,10 @@ class ControlPanelView(discord.ui.View):
 
         lines = [t(interaction.user.id, "events_header")]
         for row in rows[:20]:
-            days_list = [DAY_NAME_BY_VALUE[d] for d in row["days"].split(",") if d in DAY_NAME_BY_VALUE]
-            days_str = ", ".join(days_list) if days_list else "Unknown"
+            days_str = format_days_summary(str(row["days"] or ""))
+            channel_str = f"<#{row['channel_id']}>" if row["channel_id"] else "Default"
             lines.append(
-                f"• ID {row['id']} | {row['title']} | {row['time']} | -{row['remind_before_minutes']}m | {days_str}"
+                f"• ID {row['id']} | {row['title']} | {row['time']} | -{row['remind_before_minutes']}m | {days_str} | {channel_str}"
             )
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -955,7 +1034,7 @@ class ControlPanelView(discord.ui.View):
         try:
             rows = conn.execute(
                 """
-                SELECT id, title, time, days, remind_before_minutes, message, image_url
+                SELECT id, title, time, days, remind_before_minutes, message, image_url, channel_id
                 FROM events
                 WHERE creator_id = ? AND guild_id = ?
                 ORDER BY time ASC
@@ -1083,12 +1162,14 @@ class ControlPanelView(discord.ui.View):
                             return
 
                         days_str = format_days_summary(selected["days"])
+                        channel_str = f"<#{selected['channel_id']}>" if selected["channel_id"] else "Default"
                         summary = (
                             f"Event #{selected['id']}\n"
                             f"Title: {selected['title']}\n"
                             f"Time: {selected['time']}\n"
                             f"Days: {days_str}\n"
-                            f"Reminder: -{selected['remind_before_minutes']}m"
+                            f"Reminder: -{selected['remind_before_minutes']}m\n"
+                            f"Channel: {channel_str}"
                         )
                         await inter.response.edit_message(
                             content=summary,
