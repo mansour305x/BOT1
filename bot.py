@@ -280,6 +280,11 @@ def t(user_id: int, key: str, **kwargs) -> str:
     return template.format(**kwargs)
 
 
+def bi_text(ar: str, en: str) -> str:
+    """Return a bilingual text in Arabic and English."""
+    return f"{ar} | {en}"
+
+
 def is_bot_owner(user_id: int) -> bool:
     return user_id == BOT_OWNER_ID
 
@@ -3241,7 +3246,7 @@ class RemindersView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("ليس لديك صلاحية.", ephemeral=True)
+            await interaction.response.send_message(bi_text("ليس لديك صلاحية.", "You do not have permission."), ephemeral=True)
             return False
         return True
 
@@ -3258,12 +3263,12 @@ class RemindersView(discord.ui.View):
 
     async def _show_events_manager(self, interaction: discord.Interaction, title: str = "إدارة التذكيرات") -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Server only.", ephemeral=True)
+            await interaction.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
 
         events_rows = await self._fetch_events(interaction.user.id, interaction.guild.id)
         if not events_rows:
-            await interaction.response.send_message("لا توجد تذكيرات بعد.", ephemeral=True)
+            await interaction.response.send_message(bi_text("لا توجد تذكيرات بعد.", "No reminders yet."), ephemeral=True)
             return
 
         owner_id = self.owner_id
@@ -3277,17 +3282,17 @@ class RemindersView(discord.ui.View):
 
             async def interaction_check(self, inter: discord.Interaction) -> bool:
                 if inter.user.id != owner_id:
-                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    await inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                     return False
                 return True
 
-            @discord.ui.button(label="✍️ تعديل الرسالة", style=discord.ButtonStyle.secondary, row=0)
+            @discord.ui.button(label="✍️ تعديل الرسالة | Edit Message", style=discord.ButtonStyle.secondary, row=0)
             async def edit_message_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.send_modal(
                     EditMessageModal(self.selected_event["id"], self.selected_event["message"])
                 )
 
-            @discord.ui.button(label="⏰ تعديل الوقت والأيام", style=discord.ButtonStyle.primary, row=0)
+            @discord.ui.button(label="⏰ تعديل الوقت والأيام | Edit Time/Days", style=discord.ButtonStyle.primary, row=0)
             async def edit_schedule_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.send_modal(
                     EditScheduleModal(
@@ -3297,7 +3302,7 @@ class RemindersView(discord.ui.View):
                     )
                 )
 
-            @discord.ui.button(label="🖼️ تعديل الصورة", style=discord.ButtonStyle.secondary, row=0)
+            @discord.ui.button(label="🖼️ تعديل الصورة | Edit Image", style=discord.ButtonStyle.secondary, row=0)
             async def edit_image_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 attachment = await request_image_attachment(inter, owner_id)
                 if not attachment:
@@ -3312,7 +3317,7 @@ class RemindersView(discord.ui.View):
                     @discord.ui.button(label="✅ حفظ الصورة", style=discord.ButtonStyle.success)
                     async def confirm_save(self, conf_inter: discord.Interaction, b: discord.ui.Button) -> None:
                         if conf_inter.user.id != owner_id:
-                            await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                            await conf_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                             return
                         conn2 = get_conn()
                         try:
@@ -3323,39 +3328,39 @@ class RemindersView(discord.ui.View):
                             conn2.commit()
                         finally:
                             conn2.close()
-                        await conf_inter.response.edit_message(content="✅ تم حفظ الصورة بنجاح.", view=None)
+                        await conf_inter.response.edit_message(content=bi_text("✅ تم حفظ الصورة بنجاح.", "✅ Image saved successfully."), view=None)
 
                     @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
                     async def cancel_save(self, conf_inter: discord.Interaction, b: discord.ui.Button) -> None:
                         if conf_inter.user.id != owner_id:
-                            await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                            await conf_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                             return
-                        await conf_inter.response.edit_message(content="تم الإلغاء.", view=None)
+                        await conf_inter.response.edit_message(content=bi_text("تم الإلغاء.", "Cancelled."), view=None)
 
                 await inter.followup.send(
-                    f"📸 تم اختيار: {attachment.filename}\nهل تريد حفظها لهذا التذكير؟",
+                    f"{bi_text('📸 تم اختيار الصورة', '📸 Selected image')}: {attachment.filename}\n{bi_text('هل تريد حفظها لهذا التذكير؟', 'Do you want to save it for this reminder?')}",
                     view=ConfirmImageView(),
                     ephemeral=True,
                 )
 
-            @discord.ui.button(label="🧪 اختبار موعد التذكير", style=discord.ButtonStyle.primary, row=1)
+            @discord.ui.button(label="🧪 اختبار موعد التذكير | Test Reminder", style=discord.ButtonStyle.primary, row=1)
             async def test_event_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.defer(ephemeral=True, thinking=True)
                 try:
                     await bot.send_event_reminder(self.selected_event)
                 except Exception as exc:
                     await inter.followup.send(
-                        f"❌ فشل إرسال التذكير التجريبي: {exc}",
+                        f"{bi_text('❌ فشل إرسال التذكير التجريبي', '❌ Failed to send test reminder')}: {exc}",
                         ephemeral=True,
                     )
                     return
 
                 await inter.followup.send(
-                    "✅ تم إرسال تذكير تجريبي لهذا الموعد.",
+                    bi_text("✅ تم إرسال تذكير تجريبي لهذا الموعد.", "✅ Test reminder sent for this schedule."),
                     ephemeral=True,
                 )
 
-            @discord.ui.button(label="🗑️ حذف التذكير", style=discord.ButtonStyle.danger, row=2)
+            @discord.ui.button(label="🗑️ حذف التذكير | Delete", style=discord.ButtonStyle.danger, row=2)
             async def delete_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 conn2 = get_conn()
                 try:
@@ -3368,14 +3373,14 @@ class RemindersView(discord.ui.View):
                     conn2.close()
 
                 await inter.response.edit_message(
-                    content=f"✅ تم حذف التذكير: **{self.selected_event['title']}**",
+                    content=f"{bi_text('✅ تم حذف التذكير', '✅ Reminder deleted')}: **{self.selected_event['title']}**",
                     view=None,
                 )
 
-            @discord.ui.button(label="🔙 رجوع للقائمة", style=discord.ButtonStyle.secondary, row=2)
+            @discord.ui.button(label="🔙 رجوع للقائمة | Back", style=discord.ButtonStyle.secondary, row=2)
             async def back_to_list_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.edit_message(
-                    content=f"📋 **{title}**\nاختر تذكيراً لإدارته:",
+                    content=f"📋 **{title}**\n{bi_text('اختر تذكيراً لإدارته:', 'Choose a reminder to manage:')}",
                     view=EventsPickerView(self.all_rows),
                 )
 
@@ -3391,7 +3396,7 @@ class RemindersView(discord.ui.View):
 
                     async def on_pick(pick_inter: discord.Interaction, selected=row) -> None:
                         if pick_inter.user.id != owner_id:
-                            await pick_inter.response.send_message("Not for you.", ephemeral=True)
+                            await pick_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                             return
 
                         days_str = format_days_summary(str(selected["days"] or ""))
@@ -3401,10 +3406,10 @@ class RemindersView(discord.ui.View):
                         summary = (
                             f"**{selected['title']}**\n"
                             f"🆔 {selected['id']}\n"
-                            f"⏰ {selected['time']} | -{selected['remind_before_minutes']} دقيقة\n"
-                            f"📅 {days_str}\n"
+                            f"⏰ {selected['time']} | -{selected['remind_before_minutes']} {bi_text('دقيقة', 'minutes')}\n"
+                            f"📅 {bi_text('الأيام', 'Days')}: {days_str}\n"
                             f"📢 {channel_str}\n"
-                            f"{'🖼️ يوجد صورة' if selected['image_url'] else '📄 بدون صورة'}"
+                            f"{bi_text('🖼️ يوجد صورة', '🖼️ Has image') if selected['image_url'] else bi_text('📄 بدون صورة', '📄 No image')}"
                         )
                         await pick_inter.response.edit_message(
                             content=summary,
@@ -3415,12 +3420,12 @@ class RemindersView(discord.ui.View):
                     self.add_item(btn)
 
         await interaction.response.send_message(
-            content=f"📋 **{title}**\nاختر تذكيراً لإدارته:",
+            content=f"📋 **{title}**\n{bi_text('اختر تذكيراً لإدارته:', 'Choose a reminder to manage:')}",
             view=EventsPickerView(events_rows),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="➕ إضافة موعد فعالية", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="➕ إضافة موعد فعالية | Add Event Slot", style=discord.ButtonStyle.success, row=0)
     async def event_slot_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         owner_id = self.owner_id
         guild_id = self.guild_id
@@ -3431,40 +3436,40 @@ class RemindersView(discord.ui.View):
 
             async def interaction_check(self, inter: discord.Interaction) -> bool:
                 if inter.user.id != owner_id:
-                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    await inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                     return False
                 return True
 
-            @discord.ui.button(label="✨ إضافة تذكير", style=discord.ButtonStyle.success, row=0)
+            @discord.ui.button(label="✨ إضافة تذكير | Add Reminder", style=discord.ButtonStyle.success, row=0)
             async def create_reminder_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.send_modal(CreateEventModal())
 
-            @discord.ui.button(label="✏️ تعديل تذكير", style=discord.ButtonStyle.primary, row=0)
+            @discord.ui.button(label="✏️ تعديل تذكير | Edit Reminder", style=discord.ButtonStyle.primary, row=0)
             async def edit_reminder_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 wrapper = RemindersView(owner_id, guild_id)
                 await wrapper._show_events_manager(inter, title="تعديل التذكيرات")
 
-            @discord.ui.button(label="📋 عرض التذكيرات", style=discord.ButtonStyle.secondary, row=0)
+            @discord.ui.button(label="📋 عرض التذكيرات | List Reminders", style=discord.ButtonStyle.secondary, row=0)
             async def list_reminders_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 wrapper = RemindersView(owner_id, guild_id)
                 await wrapper._show_events_manager(inter, title="عرض التذكيرات")
 
-            @discord.ui.button(label="🔙 رجوع", style=discord.ButtonStyle.secondary, row=1)
+            @discord.ui.button(label="🔙 رجوع | Back", style=discord.ButtonStyle.secondary, row=1)
             async def back_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.edit_message(
-                    content="📋 **قسم التذكيرات المتقدم**\nاختر المهمة المطلوبة:",
+                    content=f"📋 **{bi_text('قسم التذكيرات المتقدم', 'Advanced Reminders Section')}**\n{bi_text('اختر المهمة المطلوبة:', 'Choose the required task:')}",
                     view=RemindersView(owner_id, guild_id),
                 )
 
         await interaction.response.edit_message(
-            content="🗂️ **إضافة موعد فعالية**\nاختر العملية التي تريد تنفيذها:",
+            content=f"🗂️ **{bi_text('إضافة موعد فعالية', 'Add Event Slot')}**\n{bi_text('اختر العملية التي تريد تنفيذها:', 'Choose the operation you want to run:')}",
             view=ReminderSlotView(),
         )
 
-    @discord.ui.button(label="🔧 إعدادات افتراضية", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🔧 إعدادات افتراضية | Defaults", style=discord.ButtonStyle.secondary, row=0)
     async def defaults_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Server only.", ephemeral=True)
+            await interaction.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
 
         owner_id = self.owner_id
@@ -3489,7 +3494,7 @@ class RemindersView(discord.ui.View):
 
             async def interaction_check(self, inter: discord.Interaction) -> bool:
                 if inter.user.id != owner_id:
-                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    await inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                     return False
                 return True
 
@@ -3505,7 +3510,7 @@ class RemindersView(discord.ui.View):
                     async def on_submit(self, m_inter: discord.Interaction) -> None:
                         t_val = self.time_input.value.strip()
                         if t_val not in TIMES:
-                            await m_inter.response.send_message("وقت غير صحيح.", ephemeral=True)
+                            await m_inter.response.send_message(bi_text("وقت غير صحيح.", "Invalid time value."), ephemeral=True)
                             return
                         conn2 = get_conn()
                         try:
@@ -3518,7 +3523,10 @@ class RemindersView(discord.ui.View):
                             conn2.commit()
                         finally:
                             conn2.close()
-                        await m_inter.response.send_message(f"✅ الوقت الافتراضي: **{t_val}**", ephemeral=True)
+                        await m_inter.response.send_message(
+                            f"✅ {bi_text('الوقت الافتراضي', 'Default time')}: **{t_val}**",
+                            ephemeral=True,
+                        )
 
                 await inter.response.send_modal(TimeModal())
 
@@ -3542,14 +3550,14 @@ class RemindersView(discord.ui.View):
                     )
 
                 await inter.response.edit_message(
-                    content="اختر الأيام الافتراضية:",
+                    content=bi_text("اختر الأيام الافتراضية:", "Choose default days:"),
                     view=DaysSelectView(on_days_picked, owner_id, include_alt_start=False),
                 )
 
             @discord.ui.button(label="📢 تغيير القناة الافتراضية", style=discord.ButtonStyle.secondary)
             async def set_channel(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 if not inter.guild:
-                    await inter.response.send_message("Server only.", ephemeral=True)
+                    await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
                     return
                 text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
 
@@ -3575,9 +3583,9 @@ class RemindersView(discord.ui.View):
                             conn2.commit()
                         finally:
                             conn2.close()
-                        label = f"<#{ch_id}>" if ch_id else "القناة الافتراضية للسيرفر"
+                        label = f"<#{ch_id}>" if ch_id else bi_text("القناة الافتراضية للسيرفر", "Server default channel")
                         await sel_inter.response.edit_message(
-                            content=f"✅ القناة الافتراضية: {label}",
+                            content=f"✅ {bi_text('القناة الافتراضية', 'Default channel')}: {label}",
                             view=None,
                         )
 
@@ -3586,7 +3594,10 @@ class RemindersView(discord.ui.View):
                         super().__init__(timeout=300)
                         self.add_item(ChSelect())
 
-                await inter.response.edit_message(content="اختر القناة الافتراضية:", view=ChView())
+                await inter.response.edit_message(
+                    content=bi_text("اختر القناة الافتراضية:", "Choose default channel:"),
+                    view=ChView(),
+                )
 
             @discord.ui.button(label="🔁 تغيير وقت التنبيه", style=discord.ButtonStyle.secondary)
             async def set_remind(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
@@ -3603,38 +3614,38 @@ class RemindersView(discord.ui.View):
                     finally:
                         conn2.close()
                     await mins_inter.response.edit_message(
-                        content=f"✅ وقت التنبيه الافتراضي: **{minutes} دقيقة قبل**",
+                        content=f"✅ {bi_text('وقت التنبيه الافتراضي', 'Default reminder lead time')}: **{minutes} {bi_text('دقيقة قبل', 'minutes before')}**",
                         view=None,
                     )
 
                 await inter.response.edit_message(
-                    content="اختر وقت التنبيه الافتراضي:",
+                    content=bi_text("اختر وقت التنبيه الافتراضي:", "Choose default reminder lead time:"),
                     view=ReminderMinutesSelectView(on_minutes, owner_id),
                 )
 
         await interaction.response.send_message(
-            f"**🔧 إعداداتك الافتراضية:**\n"
-            f"⏰ الوقت: `{current_time}`\n"
-            f"📅 الأيام: `{current_days}`\n"
-            f"📢 القناة: {current_ch}\n"
-            f"🔔 التنبيه: `{current_remind} دقيقة قبل`\n\n"
-            f"_سيتم تطبيق هذه القيم تلقائياً عند إنشاء تذكير جديد_",
+            f"**🔧 {bi_text('إعداداتك الافتراضية', 'Your defaults')}**\n"
+            f"⏰ {bi_text('الوقت', 'Time')}: `{current_time}`\n"
+            f"📅 {bi_text('الأيام', 'Days')}: `{current_days}`\n"
+            f"📢 {bi_text('القناة', 'Channel')}: {current_ch}\n"
+            f"🔔 {bi_text('التنبيه', 'Reminder')}: `{current_remind} {bi_text('دقيقة قبل', 'minutes before')}`\n\n"
+            f"_{bi_text('سيتم تطبيق هذه القيم تلقائياً عند إنشاء تذكير جديد', 'These values are auto-applied when creating new reminders')}_",
             view=DefaultsView(),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="📋 عرض التذكيرات", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="📋 عرض التذكيرات | List", style=discord.ButtonStyle.secondary, row=1)
     async def list_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._show_events_manager(interaction, title="عرض التذكيرات")
 
-    @discord.ui.button(label="✏️ تعديل تذكير", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="✏️ تعديل تذكير | Edit", style=discord.ButtonStyle.primary, row=1)
     async def edit_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self._show_events_manager(interaction, title="تعديل التذكيرات")
 
-    @discord.ui.button(label="🗑️ حذف تذكير", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="🗑️ حذف تذكير | Delete", style=discord.ButtonStyle.danger, row=2)
     async def delete_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Server only.", ephemeral=True)
+            await interaction.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
         conn = get_conn()
         try:
@@ -3646,7 +3657,7 @@ class RemindersView(discord.ui.View):
             conn.close()
 
         if not rows:
-            await interaction.response.send_message("لا توجد تذكيرات.", ephemeral=True)
+            await interaction.response.send_message(bi_text("لا توجد تذكيرات.", "No reminders found."), ephemeral=True)
             return
 
         owner_id = interaction.user.id
@@ -3658,7 +3669,7 @@ class RemindersView(discord.ui.View):
                 def make_delete_cb(event_id: int, event_title: str):
                     async def delete_cb(del_inter: discord.Interaction) -> None:
                         if del_inter.user.id != owner_id:
-                            await del_inter.response.send_message("Not for you.", ephemeral=True)
+                            await del_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                             return
                         conn2 = get_conn()
                         try:
@@ -3670,7 +3681,7 @@ class RemindersView(discord.ui.View):
                         finally:
                             conn2.close()
                         await del_inter.response.edit_message(
-                            content=f"✅ تم حذف: **{event_title}**",
+                            content=f"{bi_text('✅ تم حذف', '✅ Deleted')}: **{event_title}**",
                             view=None,
                         )
                     return delete_cb
@@ -3684,15 +3695,15 @@ class RemindersView(discord.ui.View):
                     self.add_item(btn)
 
         await interaction.response.send_message(
-            "اختر التذكير للحذف:",
+            bi_text("اختر التذكير للحذف:", "Choose a reminder to delete:"),
             view=DeletePickerView(),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="🔙 رجوع للرئيسية", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="🔙 رجوع للرئيسية | Home", style=discord.ButtonStyle.secondary, row=2)
     async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(
-            content="🎮 **لوحة التحكم**\nاختر قسماً:",
+            content=f"🎮 **{bi_text('لوحة التحكم', 'Control Panel')}**\n{bi_text('اختر قسماً:', 'Choose a section:')}",
             view=PanelHomeView(self.owner_id, self.guild_id),
         )
 
@@ -3707,11 +3718,11 @@ class SettingsView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("ليس لديك صلاحية.", ephemeral=True)
+            await interaction.response.send_message(bi_text("ليس لديك صلاحية.", "You do not have permission."), ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="➕ إضافة مشرف", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="➕ إضافة مشرف | Add Admin", style=discord.ButtonStyle.primary, row=0)
     async def add_admin_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         guild_id = self.guild_id
 
@@ -3728,7 +3739,7 @@ class SettingsView(discord.ui.View):
             async def on_submit(self, modal_inter: discord.Interaction) -> None:
                 raw = self.user_input.value.strip()
                 if not raw.isdigit():
-                    await modal_inter.response.send_message("User ID غير صحيح.", ephemeral=True)
+                    await modal_inter.response.send_message(bi_text("معرّف المستخدم غير صحيح.", "Invalid user ID."), ephemeral=True)
                     return
                 user_id = int(raw)
                 conn = get_conn()
@@ -3741,13 +3752,13 @@ class SettingsView(discord.ui.View):
                 finally:
                     conn.close()
                 await modal_inter.response.send_message(
-                    f"✅ تمت إضافة <@{user_id}> كمشرف.",
+                    f"✅ {bi_text('تمت إضافة', 'Added')} <@{user_id}> {bi_text('كمشرف', 'as admin') }.",
                     ephemeral=True,
                 )
 
         await inter.response.send_modal(AddAdminModal())
 
-    @discord.ui.button(label="👥 المشرفون", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="👥 المشرفون | Admins", style=discord.ButtonStyle.secondary, row=0)
     async def admins_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         conn = get_conn()
         try:
@@ -3761,7 +3772,7 @@ class SettingsView(discord.ui.View):
         admin_list = (
             "\n".join(f"• <@{a['user_id']}> (`{a['user_id']}`)" for a in admins[:30])
             if admins
-            else "لا يوجد مشرفون مضافون."
+            else bi_text("لا يوجد مشرفون مضافون.", "No admins added.")
         )
         guild_id = self.guild_id
 
@@ -3780,7 +3791,7 @@ class SettingsView(discord.ui.View):
                     async def on_submit(self, modal_inter: discord.Interaction) -> None:
                         raw = self.user_input.value.strip()
                         if not raw.isdigit():
-                            await modal_inter.response.send_message("User ID غير صحيح.", ephemeral=True)
+                            await modal_inter.response.send_message(bi_text("معرّف المستخدم غير صحيح.", "Invalid user ID."), ephemeral=True)
                             return
                         user_id = int(raw)
                         conn2 = get_conn()
@@ -3792,7 +3803,7 @@ class SettingsView(discord.ui.View):
                             conn2.commit()
                         finally:
                             conn2.close()
-                        await modal_inter.response.send_message(f"✅ تمت إضافة <@{user_id}>.", ephemeral=True)
+                        await modal_inter.response.send_message(f"✅ {bi_text('تمت إضافة', 'Added')} <@{user_id}>.", ephemeral=True)
 
                 await add_inter.response.send_modal(AddModal())
 
@@ -3807,7 +3818,7 @@ class SettingsView(discord.ui.View):
                     async def on_submit(self, modal_inter: discord.Interaction) -> None:
                         raw = self.user_input.value.strip()
                         if not raw.isdigit():
-                            await modal_inter.response.send_message("User ID غير صحيح.", ephemeral=True)
+                            await modal_inter.response.send_message(bi_text("معرّف المستخدم غير صحيح.", "Invalid user ID."), ephemeral=True)
                             return
                         user_id = int(raw)
                         conn2 = get_conn()
@@ -3819,20 +3830,20 @@ class SettingsView(discord.ui.View):
                             conn2.commit()
                         finally:
                             conn2.close()
-                        await modal_inter.response.send_message(f"✅ تم حذف <@{user_id}>.", ephemeral=True)
+                        await modal_inter.response.send_message(f"✅ {bi_text('تم حذف', 'Removed')} <@{user_id}>.", ephemeral=True)
 
                 await rm_inter.response.send_modal(RemoveModal())
 
         await inter.response.send_message(
-            f"**المشرفون ({len(admins)}):**\n{admin_list}",
+            f"**{bi_text('المشرفون', 'Admins')} ({len(admins)}):**\n{admin_list}",
             view=ManageAdminsView(),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="🖼️ صور التذكيرات", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="🖼️ صور التذكيرات | Reminder Images", style=discord.ButtonStyle.secondary, row=0)
     async def images_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         if not inter.guild:
-            await inter.response.send_message("Server only.", ephemeral=True)
+            await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
         conn = get_conn()
         try:
@@ -3844,7 +3855,7 @@ class SettingsView(discord.ui.View):
             conn.close()
 
         if not rows:
-            await inter.response.send_message("لا توجد تذكيرات.", ephemeral=True)
+            await inter.response.send_message(bi_text("لا توجد تذكيرات.", "No reminders found."), ephemeral=True)
             return
 
         owner_id = self.owner_id
@@ -3856,7 +3867,7 @@ class SettingsView(discord.ui.View):
                 def make_img_cb(selected_row):
                     async def img_cb(pick_inter: discord.Interaction) -> None:
                         if pick_inter.user.id != owner_id:
-                            await pick_inter.response.send_message("Not for you.", ephemeral=True)
+                            await pick_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                             return
 
                         attachment = await request_image_attachment(pick_inter, owner_id)
@@ -3870,7 +3881,7 @@ class SettingsView(discord.ui.View):
                             @discord.ui.button(label="✅ تأكيد الحفظ", style=discord.ButtonStyle.success)
                             async def confirm_image(self, conf_inter: discord.Interaction, button2: discord.ui.Button) -> None:
                                 if conf_inter.user.id != owner_id:
-                                    await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                                    await conf_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                                     return
                                 conn2 = get_conn()
                                 try:
@@ -3882,19 +3893,19 @@ class SettingsView(discord.ui.View):
                                 finally:
                                     conn2.close()
                                 await conf_inter.response.edit_message(
-                                    content=f"✅ تم تحديث صورة: **{selected_row['title']}**",
+                                    content=f"✅ {bi_text('تم تحديث الصورة', 'Image updated')}: **{selected_row['title']}**",
                                     view=None,
                                 )
 
                             @discord.ui.button(label="❌ إلغاء", style=discord.ButtonStyle.danger)
                             async def cancel_image(self, conf_inter: discord.Interaction, button2: discord.ui.Button) -> None:
                                 if conf_inter.user.id != owner_id:
-                                    await conf_inter.response.send_message("Not for you.", ephemeral=True)
+                                    await conf_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
                                     return
-                                await conf_inter.response.edit_message(content="تم إلغاء التحديث.", view=None)
+                                await conf_inter.response.edit_message(content=bi_text("تم إلغاء التحديث.", "Update cancelled."), view=None)
 
                         await pick_inter.followup.send(
-                            f"📸 تم اختيار: {attachment.filename}\nهل تريد حفظها لتذكير **{selected_row['title']}**؟",
+                            f"📸 {bi_text('تم اختيار', 'Selected')}: {attachment.filename}\n{bi_text('هل تريد حفظها للتذكير', 'Do you want to save it for reminder')} **{selected_row['title']}**؟",
                             view=ConfirmImageView(),
                             ephemeral=True,
                         )
@@ -3910,45 +3921,45 @@ class SettingsView(discord.ui.View):
                     self.add_item(b)
 
         await inter.response.send_message(
-            "اختر التذكير لإضافة/تحديث صورته:",
+            bi_text("اختر التذكير لإضافة/تحديث صورته:", "Choose a reminder to add/update its image:"),
             view=ImagePickerView(),
             ephemeral=True,
         )
 
-    @discord.ui.button(label="📝 تسجيل السيرفر", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="📝 تسجيل السيرفر | Register Server", style=discord.ButtonStyle.success, row=0)
     async def register_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         if not inter.guild:
-            await inter.response.send_message("Server only.", ephemeral=True)
+            await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
         synced = register_current_server(inter.guild, inter.user.id)
         await inter.response.send_message(
-            f"✅ تم تسجيل السيرفر وتحديث {synced} قناة.",
+            f"✅ {bi_text('تم تسجيل السيرفر وتحديث', 'Server registered and synced')} {synced} {bi_text('قناة', 'channels') }.",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="📚 عرض القنوات", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="📚 عرض القنوات | Show Channels", style=discord.ButtonStyle.secondary, row=0)
     async def channels_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         if not inter.guild:
-            await inter.response.send_message("Server only.", ephemeral=True)
+            await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
         rows = get_registered_server_channels(inter.guild.id, only_active=False)
         if rows:
-            lines = [f"**قنوات السيرفر المسجلة ({len(rows)}):**"]
+            lines = [f"**{bi_text('قنوات السيرفر المسجلة', 'Registered server channels')} ({len(rows)}):**"]
             for row in rows[:30]:
                 status = "✅" if int(row["is_active"]) == 1 else "❌"
                 lines.append(f"{status} #{row['channel_name']} (`{row['channel_id']}`)")
             if len(rows) > 30:
-                lines.append(f"... +{len(rows) - 30} أخرى")
+                lines.append(f"... +{len(rows) - 30} {bi_text('أخرى', 'more')}")
         else:
             text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
-            lines = [f"**قنوات السيرفر ({len(text_channels)}):**"]
+            lines = [f"**{bi_text('قنوات السيرفر', 'Server channels')} ({len(text_channels)}):**"]
             lines.extend(f"• #{ch.name} (`{ch.id}`)" for ch in text_channels[:30])
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-    @discord.ui.button(label="🔄 تحديث البوت", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="🔄 تحديث البوت | Update Bot", style=discord.ButtonStyle.primary, row=1)
     async def update_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         if not is_bot_owner(inter.user.id):
-            await inter.response.send_message("هذا الخيار لمالك البوت فقط.", ephemeral=True)
+            await inter.response.send_message(bi_text("هذا الخيار لمالك البوت فقط.", "This option is for bot owner only."), ephemeral=True)
             return
         await inter.response.defer(ephemeral=True, thinking=True)
         bot_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
@@ -3961,14 +3972,14 @@ class SettingsView(discord.ui.View):
         out, err = await proc.communicate()
         text = (out.decode().strip() or err.decode().strip())[:900]
         if proc.returncode != 0:
-            await inter.followup.send(f"فشل التحديث:\n```\n{text}\n```", ephemeral=True)
+            await inter.followup.send(f"{bi_text('فشل التحديث', 'Update failed')}:\n```\n{text}\n```", ephemeral=True)
             return
-        await inter.followup.send(f"✅ تم التحديث:\n```\n{text}\n```", ephemeral=True)
+        await inter.followup.send(f"✅ {bi_text('تم التحديث', 'Updated')}:\n```\n{text}\n```", ephemeral=True)
 
-    @discord.ui.button(label="⬆️ ترقية البوت", style=discord.ButtonStyle.success, row=1)
+    @discord.ui.button(label="⬆️ ترقية البوت | Upgrade Bot", style=discord.ButtonStyle.success, row=1)
     async def upgrade_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         if not is_bot_owner(inter.user.id):
-            await inter.response.send_message("هذا الخيار لمالك البوت فقط.", ephemeral=True)
+            await inter.response.send_message(bi_text("هذا الخيار لمالك البوت فقط.", "This option is for bot owner only."), ephemeral=True)
             return
         await inter.response.defer(ephemeral=True, thinking=True)
         bot_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
@@ -3979,7 +3990,7 @@ class SettingsView(discord.ui.View):
         git_out, git_err = await git_proc.communicate()
         git_text = (git_out.decode().strip() or git_err.decode().strip())[:500]
         if git_proc.returncode != 0:
-            await inter.followup.send(f"فشل git pull:\n```\n{git_text}\n```", ephemeral=True)
+            await inter.followup.send(f"{bi_text('فشل git pull', 'git pull failed')}:\n```\n{git_text}\n```", ephemeral=True)
             return
         pip_proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "pip", "install", "-r", "requirements.txt",
@@ -3988,17 +3999,17 @@ class SettingsView(discord.ui.View):
         pip_out, pip_err = await pip_proc.communicate()
         pip_text = (pip_out.decode().strip() or pip_err.decode().strip())[-500:]
         if pip_proc.returncode != 0:
-            await inter.followup.send(f"فشل pip install:\n```\n{pip_text}\n```", ephemeral=True)
+            await inter.followup.send(f"{bi_text('فشل pip install', 'pip install failed')}:\n```\n{pip_text}\n```", ephemeral=True)
             return
         await inter.followup.send(
-            f"✅ تمت الترقية.\nGit:\n```\n{git_text}\n```\nPip:\n```\n{pip_text}\n```",
+            f"✅ {bi_text('تمت الترقية', 'Upgraded')}.\nGit:\n```\n{git_text}\n```\nPip:\n```\n{pip_text}\n```",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="ℹ️ عن البوت", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="ℹ️ عن البوت | About", style=discord.ButtonStyle.secondary, row=1)
     async def about_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         await inter.response.send_message(
-            "**حقوق صانع البوت:**\n"
+            f"**{bi_text('حقوق صانع البوت', 'Bot creator credits')}:**\n"
             "```\n"
             "DANGER TNT\n"
             "DC = DANGER_600\n"
@@ -4007,7 +4018,7 @@ class SettingsView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="📞 التواصل مع الدعم", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="📞 التواصل مع الدعم | Support", style=discord.ButtonStyle.secondary, row=1)
     async def support_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         support_view = discord.ui.View(timeout=60)
         support_view.add_item(discord.ui.Button(
@@ -4016,15 +4027,15 @@ class SettingsView(discord.ui.View):
             url=f"https://discord.com/users/{BOT_OWNER_ID}",
         ))
         await inter.response.send_message(
-            "📞 **التواصل مع الدعم:**\nاضغط على الزر أدناه للتواصل مع DANGER_600",
+            f"📞 **{bi_text('التواصل مع الدعم', 'Support contact')}:**\n{bi_text('اضغط على الزر أدناه للتواصل مع DANGER_600', 'Press the button below to contact DANGER_600')}",
             view=support_view,
             ephemeral=True,
         )
 
-    @discord.ui.button(label="🔙 رجوع للرئيسية", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🔙 رجوع للرئيسية | Home", style=discord.ButtonStyle.secondary, row=1)
     async def back_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
         await inter.response.edit_message(
-            content="🎮 **لوحة التحكم**\nاختر قسماً:",
+            content=f"🎮 **{bi_text('لوحة التحكم', 'Control Panel')}**\n{bi_text('اختر قسماً:', 'Choose a section:')}",
             view=PanelHomeView(self.owner_id, self.guild_id),
         )
 
@@ -4039,29 +4050,29 @@ class PanelHomeView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("ليس لديك صلاحية.", ephemeral=True)
+            await interaction.response.send_message(bi_text("ليس لديك صلاحية.", "You do not have permission."), ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="📋 التذكيرات", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="📋 التذكيرات | Reminders", style=discord.ButtonStyle.primary, row=0)
     async def reminders_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.edit_message(
-            content="📋 **قسم التذكيرات**\nاختر ما تريد:",
+            content=f"📋 **{bi_text('قسم التذكيرات', 'Reminders Section')}**\n{bi_text('اختر ما تريد:', 'Choose what you want:')}",
             view=RemindersView(self.owner_id, self.guild_id),
         )
 
     @discord.ui.button(label="⚙️ الإعدادات | Settings", style=discord.ButtonStyle.secondary)
     async def settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Server only.", ephemeral=True)
+            await interaction.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
             return
 
         if not has_guild_admin_access(interaction.guild.id, interaction.user.id, interaction.guild.owner_id):
-            await interaction.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+            await interaction.response.send_message(bi_text("للمشرفين فقط.", "Admins only."), ephemeral=True)
             return
 
         await interaction.response.edit_message(
-            content="⚙️ **قسم الإعدادات**\nاختر المهمة التي تريد تنفيذها:",
+            content=f"⚙️ **{bi_text('قسم الإعدادات', 'Settings Section')}**\n{bi_text('اختر المهمة التي تريد تنفيذها:', 'Choose the task you want to run:')}",
             view=SettingsView(self.owner_id, self.guild_id),
         )
 
@@ -4069,12 +4080,28 @@ class PanelHomeView(discord.ui.View):
 @bot.tree.command(name="panel", description="Open control panel | فتح لوحة التحكم")
 async def panel(interaction: discord.Interaction) -> None:
     if not interaction.guild:
-        await interaction.response.send_message("Server only.", ephemeral=True)
+        await interaction.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
         return
 
     await interaction.response.send_message(
-        "🎮 لوحة التحكم",
+        f"🎮 {bi_text('لوحة التحكم', 'Control Panel')}",
         view=PanelHomeView(owner_id=interaction.user.id, guild_id=interaction.guild.id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="language", description="Change language | تغيير اللغة")
+@app_commands.describe(lang="Language code: en or ar")
+@app_commands.choices(
+    lang=[
+        app_commands.Choice(name="English", value="en"),
+        app_commands.Choice(name="العربية", value="ar"),
+    ]
+)
+async def language(interaction: discord.Interaction, lang: app_commands.Choice[str]) -> None:
+    set_user_lang(interaction.user.id, lang.value)
+    await interaction.response.send_message(
+        t(interaction.user.id, "lang_set"),
         ephemeral=True,
     )
 
@@ -4084,7 +4111,7 @@ async def owner_settings(interaction: discord.Interaction) -> None:
     """إعدادات خاصة بمالك البوت فقط"""
     if interaction.user.id != BOT_OWNER_ID:
         await interaction.response.send_message(
-            "هذا الأمر خاص بمالك البوت فقط.",
+            bi_text("هذا الأمر خاص بمالك البوت فقط.", "This command is for bot owner only."),
             ephemeral=True,
         )
         return
@@ -4094,33 +4121,36 @@ async def owner_settings(interaction: discord.Interaction) -> None:
             super().__init__(timeout=600)
             self.add_item(
                 discord.ui.Button(
-                    label="📞 التواصل مع الدعم",
+                    label="📞 التواصل مع الدعم | Support",
                     style=discord.ButtonStyle.link,
                     url=f"https://discord.com/users/{BOT_OWNER_ID}",
                 )
             )
 
-        @discord.ui.button(label="🛠️ إدارة سيرفرات المالك", style=discord.ButtonStyle.primary)
+        @discord.ui.button(label="🛠️ إدارة سيرفرات المالك | Owner Servers", style=discord.ButtonStyle.primary)
         async def owner_servers_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             if not inter.guild:
-                await inter.response.send_message("استخدم هذا الزر داخل سيرفر.", ephemeral=True)
+                await inter.response.send_message(bi_text("استخدم هذا الزر داخل سيرفر.", "Use this button inside a server."), ephemeral=True)
                 return
             await inter.response.send_message(
-                "لوحة إعدادات المالك للسيرفرات:",
+                bi_text("لوحة إعدادات المالك للسيرفرات:", "Owner server settings panel:"),
                 view=OwnerServerSettingsView(owner_id=inter.user.id, guild_id=inter.guild.id),
                 ephemeral=True,
             )
 
-        @discord.ui.button(label="🔄 مزامنة الأوامر", style=discord.ButtonStyle.success)
+        @discord.ui.button(label="🔄 مزامنة الأوامر | Sync Commands", style=discord.ButtonStyle.success)
         async def sync_commands_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             await inter.response.defer(ephemeral=True, thinking=True)
             synced = await bot.tree.sync()
-            await inter.followup.send(f"✅ تمت مزامنة {len(synced)} أمر.", ephemeral=True)
+            await inter.followup.send(
+                f"✅ {bi_text('تمت مزامنة', 'Synced')} {len(synced)} {bi_text('أمر', 'commands')}.",
+                ephemeral=True,
+            )
 
-        @discord.ui.button(label="©️ حقوق صانع البوت", style=discord.ButtonStyle.secondary)
+        @discord.ui.button(label="©️ حقوق صانع البوت | Credits", style=discord.ButtonStyle.secondary)
         async def credits_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             await inter.response.send_message(
-                "حقوق صانع البوت:\n"
+                f"{bi_text('حقوق صانع البوت', 'Bot creator credits')}:\n"
                 "DANGER TNT\n"
                 "DC = DANGER_600\n"
                 ":$\n"
@@ -4129,7 +4159,7 @@ async def owner_settings(interaction: discord.Interaction) -> None:
             )
 
     await interaction.response.send_message(
-        "⚙️ إعدادات المالك (أمر منفصل):",
+        bi_text("⚙️ إعدادات المالك (أمر منفصل):", "⚙️ Owner settings (separate command):"),
         view=OwnerSettingsView(),
         ephemeral=True,
     )
@@ -4139,13 +4169,13 @@ async def owner_settings(interaction: discord.Interaction) -> None:
 async def setup(interaction: discord.Interaction) -> None:
     if interaction.user.id != BOT_OWNER_ID:
         await interaction.response.send_message(
-            "هذا الأمر خاص بمالك البوت فقط.",
+            bi_text("هذا الأمر خاص بمالك البوت فقط.", "This command is for bot owner only."),
             ephemeral=True,
         )
         return
 
     if not interaction.guild:
-        await interaction.response.send_message("يجب استخدام هذا الأمر داخل سيرفر.", ephemeral=True)
+        await interaction.response.send_message(bi_text("يجب استخدام هذا الأمر داخل سيرفر.", "This command must be used inside a server."), ephemeral=True)
         return
 
     guild_id = interaction.guild.id
@@ -4154,61 +4184,64 @@ async def setup(interaction: discord.Interaction) -> None:
         def __init__(self) -> None:
             super().__init__(timeout=600)
             self.add_item(discord.ui.Button(
-                label="📞 التواصل مع الدعم - DANGER_600",
+                label="📞 التواصل مع الدعم | Support - DANGER_600",
                 style=discord.ButtonStyle.link,
                 url=f"https://discord.com/users/{BOT_OWNER_ID}",
                 row=2,
             ))
 
-        @discord.ui.button(label="📝 تسجيل هذا السيرفر", style=discord.ButtonStyle.success, row=0)
+        @discord.ui.button(label="📝 تسجيل هذا السيرفر | Register Server", style=discord.ButtonStyle.success, row=0)
         async def register_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             if not inter.guild:
-                await inter.response.send_message("Server only.", ephemeral=True)
+                await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
                 return
             synced = register_current_server(inter.guild, inter.user.id)
             await inter.response.send_message(
-                f"✅ تم تسجيل **{inter.guild.name}** وتحديث {synced} قناة.",
+                f"✅ {bi_text('تم تسجيل', 'Registered')} **{inter.guild.name}** {bi_text('وتحديث', 'and synced')} {synced} {bi_text('قناة', 'channels')}.",
                 ephemeral=True,
             )
 
-        @discord.ui.button(label="🔄 مزامنة الأوامر", style=discord.ButtonStyle.secondary, row=0)
+        @discord.ui.button(label="🔄 مزامنة الأوامر | Sync Commands", style=discord.ButtonStyle.secondary, row=0)
         async def sync_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             await inter.response.defer(ephemeral=True, thinking=True)
             synced = await bot.tree.sync()
-            await inter.followup.send(f"✅ تمت مزامنة {len(synced)} أمر.", ephemeral=True)
+            await inter.followup.send(
+                f"✅ {bi_text('تمت مزامنة', 'Synced')} {len(synced)} {bi_text('أمر', 'commands')}.",
+                ephemeral=True,
+            )
 
-        @discord.ui.button(label="🛠️ إدارة السيرفرات", style=discord.ButtonStyle.primary, row=1)
+        @discord.ui.button(label="🛠️ إدارة السيرفرات | Manage Servers", style=discord.ButtonStyle.primary, row=1)
         async def manage_servers_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             if not inter.guild:
-                await inter.response.send_message("Server only.", ephemeral=True)
+                await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
                 return
             await inter.response.send_message(
-                "لوحة إدارة السيرفرات:",
+                bi_text("لوحة إدارة السيرفرات:", "Server management panel:"),
                 view=OwnerServerSettingsView(owner_id=inter.user.id, guild_id=inter.guild.id),
                 ephemeral=True,
             )
 
-        @discord.ui.button(label="📚 عرض القنوات", style=discord.ButtonStyle.secondary, row=1)
+        @discord.ui.button(label="📚 عرض القنوات | Show Channels", style=discord.ButtonStyle.secondary, row=1)
         async def channels_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             if not inter.guild:
-                await inter.response.send_message("Server only.", ephemeral=True)
+                await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
                 return
             rows = get_registered_server_channels(inter.guild.id, only_active=False)
             if rows:
-                lines = [f"**قنوات مسجلة ({len(rows)}):**"]
+                lines = [f"**{bi_text('قنوات مسجلة', 'Registered channels')} ({len(rows)}):**"]
                 for row in rows[:30]:
                     s = "✅" if int(row["is_active"]) == 1 else "❌"
                     lines.append(f"{s} #{row['channel_name']} (`{row['channel_id']}`)")
             else:
                 text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
-                lines = [f"**قنوات السيرفر ({len(text_channels)}):**"]
+                lines = [f"**{bi_text('قنوات السيرفر', 'Server channels')} ({len(text_channels)}):**"]
                 lines.extend(f"• #{ch.name} (`{ch.id}`)" for ch in text_channels[:30])
             await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-        @discord.ui.button(label="ℹ️ حقوق صانع البوت", style=discord.ButtonStyle.secondary, row=1)
+        @discord.ui.button(label="ℹ️ حقوق صانع البوت | Credits", style=discord.ButtonStyle.secondary, row=1)
         async def credits_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
             await inter.response.send_message(
-                "**حقوق صانع البوت:**\n"
+                f"**{bi_text('حقوق صانع البوت', 'Bot creator credits')}:**\n"
                 "```\n"
                 "DANGER TNT\n"
                 "DC = DANGER_600\n"
@@ -4218,7 +4251,7 @@ async def setup(interaction: discord.Interaction) -> None:
             )
 
     await interaction.response.send_message(
-        f"⚙️ **إعدادات المالك - {interaction.guild.name}:**",
+        f"⚙️ **{bi_text('إعدادات المالك', 'Owner setup')} - {interaction.guild.name}:**",
         view=SetupView(),
         ephemeral=True,
     )
