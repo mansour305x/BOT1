@@ -15,9 +15,9 @@ def test_times_list():
     assert "00:00" in bot.TIMES, "00:00 should be in TIMES"
     assert "23:30" in bot.TIMES, "23:30 should be in TIMES"
     assert "12:00" in bot.TIMES, "12:00 should be in TIMES"
-    assert len(bot.TIMES) == 48, f"TIMES should have 48 entries, got {len(bot.TIMES)}"
+    assert "24:00" in bot.TIMES, "24:00 should be in TIMES"
+    assert len(bot.TIMES) == 49, f"TIMES should have 49 entries, got {len(bot.TIMES)}"
     assert "00:15" not in bot.TIMES, "00:15 should NOT be in TIMES"
-    assert "24:00" not in bot.TIMES, "24:00 should NOT be in TIMES"
     print("✓ TIMES list is correct")
 
 
@@ -92,13 +92,23 @@ def test_translation_function():
 def test_event_time_validation():
     """Test TIMES-based event time validation."""
     print("Testing event time validation...")
-    valid_times = ["00:00", "00:30", "12:00", "23:30"]
-    invalid_times = ["24:00", "00:15", "invalid", "", "1:00", "12:60"]
+    valid_times = ["00:00", "00:30", "12:00", "23:30", "24:00"]
+    invalid_times = ["00:15", "invalid", "", "1:00", "12:60", "24:30"]
     for time in valid_times:
         assert time in bot.TIMES, f"{time} should be valid"
     for time in invalid_times:
         assert time not in bot.TIMES, f"{time} should be invalid"
     print("✓ Event time validation works")
+
+
+def test_parse_event_time():
+    """Test parsing time strings including 24:00."""
+    print("Testing parse_event_time...")
+    h, m, add_day = bot.parse_event_time("12:30")
+    assert (h, m, add_day) == (12, 30, False), "Normal time parsing failed"
+    h, m, add_day = bot.parse_event_time("24:00")
+    assert (h, m, add_day) == (0, 0, True), "24:00 parsing should roll to next day"
+    print("✓ parse_event_time works")
 
 
 def test_database_schema():
@@ -141,6 +151,7 @@ def test_view_classes_exist():
     """Test that all view classes are defined and importable."""
     print("Testing view classes...")
     assert hasattr(bot, "ControlPanelView"), "ControlPanelView not found"
+    assert hasattr(bot, "MainPanelView"), "MainPanelView not found"
     assert hasattr(bot, "DaysSelectView"), "DaysSelectView not found"
     assert hasattr(bot, "ReminderMinutesSelectView"), "ReminderMinutesSelectView not found"
     print("✓ All view classes exist")
@@ -168,6 +179,7 @@ def run_all_tests():
         test_user_language_settings,
         test_translation_function,
         test_event_time_validation,
+        test_parse_event_time,
         test_database_schema,
         test_modal_classes_exist,
         test_view_classes_exist,

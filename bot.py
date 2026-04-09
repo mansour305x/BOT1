@@ -3,8 +3,12 @@ import datetime as dt
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
+import urllib.request
+import zipfile
 from typing import Optional
 
 import discord
@@ -15,9 +19,12 @@ from dotenv import load_dotenv
 DB_PATH = "events.db"
 CHECK_INTERVAL_SECONDS = 30
 BOT_OWNER_ID = 1376784524016619551
+GITHUB_REPO_OWNER = "mansour305x"
+GITHUB_REPO_NAME = "BOT1"
+GITHUB_REPO_BRANCH = "main"
 
-# Predefined times (00:00 to 23:30 in 30-minute intervals)
-TIMES = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
+# Predefined times (00:00 to 23:30 in 30-minute intervals) + 24:00
+TIMES = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)] + ["24:00"]
 REMINDER_MINUTES_OPTIONS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
 
 COLOR_PRESETS = [
@@ -65,11 +72,20 @@ def is_every_other_day_active(created_at_iso: Optional[str], target_date: dt.dat
         return True
     return (target_date - start_date).days % 2 == 0
 
+
+def parse_event_time(time_value: str) -> tuple[int, int, bool]:
+    """Parse stored event time and return (hour, minute, add_one_day)."""
+    if time_value == "24:00":
+        return 0, 0, True
+
+    hour, minute = map(int, time_value.split(":"))
+    return hour, minute, False
+
 MESSAGES = {
     "en": {
         "lang_set": "Language updated to English.",
         "invalid_lang": "Invalid language. Use `en` or `ar`.",
-        "invalid_time_choice": "Invalid time. Use one of the allowed values like 00:00, 00:30 ... 23:30.",
+        "invalid_time_choice": "Invalid time. Use allowed values like 00:00, 00:30 ... 23:30 or 24:00.",
         "time_in_past": "Event time must be in the future.",
         "reminder_in_past": "Reminder time is already in the past.",
         "event_created": "Event created successfully. ID: **{event_id}**.",
@@ -94,7 +110,7 @@ MESSAGES = {
     "ar": {
         "lang_set": "تم تحديث اللغة إلى العربية.",
         "invalid_lang": "لغة غير صحيحة.",
-        "invalid_time_choice": "وقت غير صحيح. استخدم قيمة مسموحة مثل 00:00 أو 00:30 إلى 23:30.",
+        "invalid_time_choice": "وقت غير صحيح. استخدم قيمة مسموحة مثل 00:00 أو 00:30 إلى 23:30 أو 24:00.",
         "time_in_past": "الوقت يجب أن يكون في المستقبل.",
         "reminder_in_past": "وقت التذكير في الماضي.",
         "event_created": "تم إنشاء الفعالية بنجاح. المعرّف: **{event_id}**.",
@@ -177,6 +193,29 @@ def get_conn() -> sqlite3.Connection:
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS registered_servers (
+            guild_id INTEGER PRIMARY KEY,
+            guild_name TEXT NOT NULL,
+            guild_owner_id INTEGER,
+            registered_by INTEGER NOT NULL,
+            registered_at TEXT NOT NULL,
+            last_channel_sync_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS registered_server_channels (
+            guild_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            channel_name TEXT NOT NULL,
+            position INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, channel_id)
+        )
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS color_roles (
             guild_id INTEGER NOT NULL,
             role_id INTEGER NOT NULL,
@@ -242,10 +281,244 @@ def has_guild_admin_access(guild_id: int, user_id: int, guild_owner_id: int) -> 
     return is_guild_admin(guild_id, user_id)
 
 
+def can_manage_server_settings(user_id: int) -> bool:
+    return is_bot_owner(user_id)
+
+
+def register_server_record(guild: discord.Guild, registered_by: int) -> None:
+    conn = get_conn()
+    try:
+        now_iso = dt.datetime.now().isoformat()
+        conn.execute(
+            """
+            INSERT INTO registered_servers (
+                guild_id, guild_name, guild_owner_id, registered_by, registered_at, last_channel_sync_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                guild_name = excluded.guild_name,
+                guild_owner_id = excluded.guild_owner_id,
+                registered_by = excluded.registered_by
+            """,
+            (guild.id, guild.name, guild.owner_id, registered_by, now_iso, now_iso),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sync_registered_server_channels(guild: discord.Guild) -> int:
+    text_channels = sorted(guild.text_channels, key=lambda c: c.position)
+    now_iso = dt.datetime.now().isoformat()
+
+    conn = get_conn()
+    try:
+        for idx, ch in enumerate(text_channels):
+            conn.execute(
+                """
+                INSERT INTO registered_server_channels (
+                    guild_id, channel_id, channel_name, position, is_active, updated_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                    channel_name = excluded.channel_name,
+                    position = excluded.position,
+                    is_active = 1,
+                    updated_at = excluded.updated_at
+                """,
+                (guild.id, ch.id, ch.name, idx, now_iso),
+            )
+
+        existing_rows = conn.execute(
+            "SELECT channel_id FROM registered_server_channels WHERE guild_id = ?",
+            (guild.id,),
+        ).fetchall()
+        existing_ids = {row["channel_id"] for row in existing_rows}
+        active_ids = {ch.id for ch in text_channels}
+        for stale_id in existing_ids - active_ids:
+            conn.execute(
+                """
+                UPDATE registered_server_channels
+                SET is_active = 0, updated_at = ?
+                WHERE guild_id = ? AND channel_id = ?
+                """,
+                (now_iso, guild.id, stale_id),
+            )
+
+        conn.execute(
+            "UPDATE registered_servers SET last_channel_sync_at = ?, guild_name = ?, guild_owner_id = ? WHERE guild_id = ?",
+            (now_iso, guild.name, guild.owner_id, guild.id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return len(text_channels)
+
+
+def is_server_registered(guild_id: int) -> bool:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM registered_servers WHERE guild_id = ?",
+            (guild_id,),
+        ).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
+def get_registered_server_channels(guild_id: int, only_active: bool = True) -> list[sqlite3.Row]:
+    conn = get_conn()
+    try:
+        if only_active:
+            rows = conn.execute(
+                """
+                SELECT channel_id, channel_name, position
+                FROM registered_server_channels
+                WHERE guild_id = ? AND is_active = 1
+                ORDER BY position ASC, channel_name ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT channel_id, channel_name, position, is_active
+                FROM registered_server_channels
+                WHERE guild_id = ?
+                ORDER BY position ASC, channel_name ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+
+def ensure_server_settings_row(guild_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO server_settings (guild_id)
+            VALUES (?)
+            ON CONFLICT(guild_id) DO NOTHING
+            """,
+            (guild_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def register_current_server(guild: discord.Guild, registered_by: int) -> int:
+    ensure_server_settings_row(guild.id)
+    register_server_record(guild, registered_by)
+    return sync_registered_server_channels(guild)
+
+
 def validate_image_url(url: Optional[str]) -> bool:
     if url is None or url == "":
         return True
     return url.startswith("http://") or url.startswith("https://")
+
+
+async def run_bot_update() -> tuple[bool, str]:
+    bot_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
+
+    if os.path.isdir(os.path.join(bot_dir, ".git")):
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=bot_dir,
+        )
+        stdout, stderr = await proc.communicate()
+        output = (stdout.decode().strip() or stderr.decode().strip())[:1200]
+        if proc.returncode != 0:
+            return False, f"Git update failed:\n{output}"
+
+        pip_proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            "requirements.txt",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=bot_dir,
+        )
+        pip_stdout, pip_stderr = await pip_proc.communicate()
+        pip_output = (pip_stdout.decode().strip() or pip_stderr.decode().strip())[-800:]
+        if pip_proc.returncode != 0:
+            return False, f"Dependency install failed:\n{pip_output}"
+
+        return True, f"{output}\n\nDependencies:\n{pip_output}"
+
+    zip_url = f"https://codeload.github.com/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/zip/refs/heads/{GITHUB_REPO_BRANCH}"
+    keep_names = {".env", "events.db", "bot.log", "bot.out", "__pycache__"}
+
+    def download_and_extract() -> str:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, "repo.zip")
+            urllib.request.urlretrieve(zip_url, zip_path)
+
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                archive.extractall(temp_dir)
+
+            extracted_root = None
+            for name in os.listdir(temp_dir):
+                candidate = os.path.join(temp_dir, name)
+                if os.path.isdir(candidate) and name.startswith(f"{GITHUB_REPO_NAME}-"):
+                    extracted_root = candidate
+                    break
+
+            if extracted_root is None:
+                raise RuntimeError("Unable to locate extracted repository files.")
+
+            for entry in os.listdir(extracted_root):
+                if entry in keep_names:
+                    continue
+
+                src = os.path.join(extracted_root, entry)
+                dst = os.path.join(bot_dir, entry)
+
+                if os.path.isdir(dst) and not os.path.islink(dst):
+                    shutil.rmtree(dst)
+                elif os.path.exists(dst):
+                    os.remove(dst)
+
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+
+        return "Downloaded latest GitHub source archive and replaced bot files."
+
+    try:
+        update_output = await asyncio.to_thread(download_and_extract)
+    except Exception as exc:
+        return False, f"Archive update failed:\n{exc}"
+
+    pip_proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "-r",
+        "requirements.txt",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=bot_dir,
+    )
+    pip_stdout, pip_stderr = await pip_proc.communicate()
+    pip_output = (pip_stdout.decode().strip() or pip_stderr.decode().strip())[-800:]
+    if pip_proc.returncode != 0:
+        return False, f"Dependency install failed:\n{pip_output}"
+
+    return True, f"{update_output}\n\nDependencies:\n{pip_output}"
 
 
 async def ensure_color_roles(guild: discord.Guild):
@@ -483,6 +756,41 @@ class ReminderBot(commands.Bot):
         logging.info(f"Connected to {len(self.guilds)} guild(s)")
         logging.info("Ready to accept /panel commands")
 
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        if is_server_registered(guild.id):
+            try:
+                sync_registered_server_channels(guild)
+            except Exception as e:
+                logging.warning(f"Failed to sync channels on guild join ({guild.id}): {e}")
+
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
+        guild = getattr(channel, "guild", None)
+        if guild and is_server_registered(guild.id):
+            try:
+                sync_registered_server_channels(guild)
+            except Exception as e:
+                logging.warning(f"Failed to sync channels on create ({guild.id}): {e}")
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
+        guild = getattr(channel, "guild", None)
+        if guild and is_server_registered(guild.id):
+            try:
+                sync_registered_server_channels(guild)
+            except Exception as e:
+                logging.warning(f"Failed to sync channels on delete ({guild.id}): {e}")
+
+    async def on_guild_channel_update(
+        self,
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ) -> None:
+        guild = getattr(after, "guild", None)
+        if guild and is_server_registered(guild.id):
+            try:
+                sync_registered_server_channels(guild)
+            except Exception as e:
+                logging.warning(f"Failed to sync channels on update ({guild.id}): {e}")
+
     @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
     async def reminder_loop(self) -> None:
         now = dt.datetime.now().replace(second=0, microsecond=0)
@@ -493,7 +801,7 @@ class ReminderBot(commands.Bot):
             rows = conn.execute("SELECT * FROM events").fetchall()
             for row in rows:
                 try:
-                    event_hour, event_minute = map(int, row["time"].split(":"))
+                    event_hour, event_minute, add_one_day = parse_event_time(str(row["time"]))
                 except Exception:
                     continue
 
@@ -512,6 +820,9 @@ class ReminderBot(commands.Bot):
                     event_date = now.date() + dt.timedelta(days=offset_days)
                     if not date_is_active(event_date):
                         continue
+
+                    if add_one_day:
+                        event_date = event_date + dt.timedelta(days=1)
 
                     event_dt = dt.datetime.combine(event_date, dt.time(hour=event_hour, minute=event_minute))
                     trigger_dt = event_dt - dt.timedelta(minutes=remind_before)
@@ -663,7 +974,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
         self.title_input = discord.ui.TextInput(label="Title | العنوان", max_length=120)
         self.time_input = discord.ui.TextInput(
             label="Event time | وقت الفعالية",
-            placeholder="00:00, 00:30 ... 23:30",
+            placeholder="00:00, 00:30 ... 23:30, 24:00",
             max_length=5,
         )
         self.add_item(self.title_input)
@@ -689,6 +1000,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
 
         self.selected_time = selected_time
         self.selected_image_url = None
+        modal_self = self  # capture modal reference for inner class closures
 
         class ConfirmCreateView(discord.ui.View):
             def __init__(self):
@@ -744,7 +1056,7 @@ class CreateEventModal(discord.ui.Modal, title="Create Event | إنشاء الف
                     await inter.followup.send("المرفق ليس صورة. أرسل صورة فقط.", ephemeral=True)
                     return
 
-                self.selected_image_url = attachment.url
+                modal_self.selected_image_url = attachment.url
                 await inter.followup.send("تم حفظ الصورة بنجاح.", ephemeral=True)
 
         async def on_reminder_selected(inter: discord.Interaction, minutes: int) -> None:
@@ -928,7 +1240,7 @@ class EditScheduleModal(discord.ui.Modal, title="Edit Reminder Schedule"):
         )
         self.time_input = discord.ui.TextInput(
             label="Event time | وقت الفعالية",
-            placeholder="00:00, 00:30 ... 23:30",
+            placeholder="00:00, 00:30 ... 23:30, 24:00",
             max_length=5,
             default=current_time,
         )
@@ -1375,7 +1687,15 @@ class ControlPanelView(discord.ui.View):
             def __init__(self, parent_user_id: int):
                 super().__init__(timeout=300)
                 self.parent_user_id = parent_user_id
-                for row in rows[:25]:
+
+            async def interaction_check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != self.parent_user_id:
+                    await inter.response.send_message("Not for you.", ephemeral=True)
+                    return False
+                return True
+
+            def _build_buttons(self, rows_data) -> None:
+                for row in rows_data[:25]:
                     def make_delete(event_id: int):
                         async def delete_callback(inter: discord.Interaction) -> None:
                             conn2 = get_conn()
@@ -1387,7 +1707,6 @@ class ControlPanelView(discord.ui.View):
                                 conn2.commit()
                             finally:
                                 conn2.close()
-
                             await inter.response.send_message(
                                 t(self.parent_user_id, "event_deleted"),
                                 ephemeral=True,
@@ -1395,15 +1714,18 @@ class ControlPanelView(discord.ui.View):
                         return delete_callback
 
                     btn = discord.ui.Button(
-                        label=f"Delete: {row['title'][:20]}",
+                        label=f"🗑 {row['title'][:22]}",
                         style=discord.ButtonStyle.danger,
                     )
                     btn.callback = make_delete(row["id"])
                     self.add_item(btn)
 
+        dv = DeleteView(interaction.user.id)
+        dv._build_buttons(rows)
+
         await interaction.response.send_message(
-            "Select event to delete:",
-            view=DeleteView(interaction.user.id),
+            "اختر التذكير الذي تريد حذفه:",
+            view=dv,
             ephemeral=True,
         )
 
@@ -2141,11 +2463,251 @@ class ControlPanelView(discord.ui.View):
         asyncio.create_task(_restart())
 
 
+class OwnerAddAdminModal(discord.ui.Modal, title="Owner: Add Server Admin"):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.user_input = discord.ui.TextInput(
+            label="User ID",
+            placeholder="123456789012345678",
+            max_length=25,
+        )
+        self.add_item(self.user_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.user_input.value.strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("User ID غير صحيح.", ephemeral=True)
+            return
+
+        user_id = int(raw)
+        conn = get_conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO admins (guild_id, user_id) VALUES (?, ?)",
+                (self.guild_id, user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        await interaction.response.send_message(
+            f"تمت إضافة المستخدم <@{user_id}> كأدمن للسيرفر.",
+            ephemeral=True,
+        )
+
+
+class OwnerServerSettingsView(discord.ui.View):
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id or not is_bot_owner(interaction.user.id):
+            await interaction.response.send_message("هذه اللوحة لمالك البوت فقط.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Register Current Server | تسجيل السيرفر الحالي", style=discord.ButtonStyle.success)
+    async def register_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        try:
+            synced_count = register_current_server(interaction.guild, interaction.user.id)
+        except Exception as e:
+            await interaction.response.send_message(f"فشل تسجيل السيرفر: {e}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            (
+                "تم تسجيل السيرفر الحالي بنجاح.\n"
+                f"Server: **{interaction.guild.name}** (`{interaction.guild.id}`)\n"
+                f"Owner ID: `{interaction.guild.owner_id}`\n"
+                f"Synced Text Channels: **{synced_count}**"
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Add Admin | إضافة أدمن", style=discord.ButtonStyle.primary)
+    async def add_admin(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(OwnerAddAdminModal(self.guild_id))
+
+    @discord.ui.button(label="List Registered Servers | عرض السيرفرات", style=discord.ButtonStyle.secondary)
+    async def list_servers(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                """
+                SELECT guild_id, guild_name, guild_owner_id, registered_by, registered_at, last_channel_sync_at
+                FROM registered_servers
+                ORDER BY registered_at DESC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.response.send_message("لا توجد سيرفرات مسجلة حالياً.", ephemeral=True)
+            return
+
+        lines = ["السيرفرات المسجلة:"]
+        for row in rows[:20]:
+            in_bot = "داخل البوت" if bot.get_guild(row["guild_id"]) else "غير متاح حالياً"
+            lines.append(
+                (
+                    f"- {row['guild_name']} (`{row['guild_id']}`) | Owner: `{row['guild_owner_id']}` | "
+                    f"By: `{row['registered_by']}` | Sync: {row['last_channel_sync_at'] or '-'} | {in_bot}"
+                )
+            )
+        if len(rows) > 20:
+            lines.append(f"... +{len(rows) - 20} more")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Show Current Channels | عرض قنوات السيرفر", style=discord.ButtonStyle.secondary)
+    async def show_channels(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        rows = get_registered_server_channels(interaction.guild.id, only_active=False)
+        if not rows:
+            await interaction.response.send_message(
+                "لا توجد قنوات محفوظة لهذا السيرفر. سجل السيرفر أولاً ثم أعد المزامنة.",
+                ephemeral=True,
+            )
+            return
+
+        lines = [f"قنوات السيرفر `{interaction.guild.id}`:"]
+        for row in rows[:30]:
+            status = "active" if int(row["is_active"]) == 1 else "inactive"
+            lines.append(f"- #{row['channel_name']} (`{row['channel_id']}`) | {status}")
+        if len(rows) > 30:
+            lines.append(f"... +{len(rows) - 30} more")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Sync Current Channels | تحديث قنوات السيرفر", style=discord.ButtonStyle.primary)
+    async def sync_current(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        if not is_server_registered(interaction.guild.id):
+            await interaction.response.send_message(
+                "السيرفر غير مسجل. استخدم زر تسجيل السيرفر الحالي أولاً.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            synced = sync_registered_server_channels(interaction.guild)
+        except Exception as e:
+            await interaction.response.send_message(f"فشلت مزامنة القنوات: {e}", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"تم تحديث قنوات السيرفر بنجاح. عدد القنوات النصية المتزامنة: {synced}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Sync All Registered | تحديث كل السيرفرات", style=discord.ButtonStyle.danger)
+    async def sync_all(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        conn = get_conn()
+        try:
+            rows = conn.execute("SELECT guild_id FROM registered_servers ORDER BY guild_id ASC").fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.followup.send("لا توجد سيرفرات مسجلة للمزامنة.", ephemeral=True)
+            return
+
+        synced_servers = 0
+        missing_servers = 0
+        synced_channels_total = 0
+        for row in rows:
+            guild = bot.get_guild(int(row["guild_id"]))
+            if guild is None:
+                missing_servers += 1
+                continue
+            try:
+                synced_channels_total += sync_registered_server_channels(guild)
+                synced_servers += 1
+            except Exception:
+                continue
+
+        await interaction.followup.send(
+            (
+                "انتهت مزامنة السيرفرات المسجلة.\n"
+                f"Servers synced: **{synced_servers}**\n"
+                f"Missing/Unavailable: **{missing_servers}**\n"
+                f"Total channels synced: **{synced_channels_total}**"
+            ),
+            ephemeral=True,
+        )
+
+
+class MainPanelView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Not for you.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="إنشاء تذكير | Create", style=discord.ButtonStyle.success)
+    async def create_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CreateEventModal())
+
+    @discord.ui.button(label="عرض تذكيراتي | List", style=discord.ButtonStyle.secondary)
+    async def list_reminders(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        legacy_view = ControlPanelView(owner_id=self.owner_id)
+        await legacy_view.list_events(interaction, None)
+
+    @discord.ui.button(label="تعديل تذكير | Edit", style=discord.ButtonStyle.primary)
+    async def edit_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        legacy_view = ControlPanelView(owner_id=self.owner_id)
+        await legacy_view.edit_message(interaction, None)
+
+    @discord.ui.button(label="حذف تذكير | Delete", style=discord.ButtonStyle.danger)
+    async def delete_reminder(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        legacy_view = ControlPanelView(owner_id=self.owner_id)
+        await legacy_view.delete_event(interaction, None)
+
+    @discord.ui.button(label="إعدادات السيرفر | Server Settings", style=discord.ButtonStyle.secondary)
+    async def server_register(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        if not is_bot_owner(interaction.user.id):
+            await interaction.response.send_message(
+                "هذه الإعدادات متاحة فقط لمالك البوت.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "لوحة إعدادات السيرفر (للمالك فقط):",
+            view=OwnerServerSettingsView(interaction.user.id, interaction.guild.id),
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="panel", description="Open control panel | فتح لوحة التحكم")
 async def panel(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
-        "Control Panel | لوحة التحكم",
-        view=ControlPanelView(owner_id=interaction.user.id),
+        "Main Panel | اللوحة الرئيسية",
+        view=MainPanelView(owner_id=interaction.user.id),
         ephemeral=True,
     )
 
