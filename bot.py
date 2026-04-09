@@ -958,9 +958,13 @@ class ReminderBot(commands.Bot):
         embed_color = discord.Color.blurple()
         try:
             if row["embed_color"]:
-                embed_color = discord.Color(int(str(row["embed_color"]), 16))
-        except Exception:
-            pass
+                hex_val = str(row["embed_color"]).strip().lstrip("#")
+                if len(hex_val) == 6 and all(c in "0123456789abcdefABCDEF" for c in hex_val):
+                    embed_color = discord.Color(int(hex_val, 16))
+                else:
+                    logging.warning(f"Invalid embed_color value for event #{row['id']}: {row['embed_color']!r}")
+        except Exception as e:
+            logging.warning(f"Failed to parse embed_color for event #{row['id']}: {e}")
 
         embed = discord.Embed(
             title=msg_dict["event_reminder_title"],
@@ -2982,10 +2986,26 @@ class OwnerAdvancedView(discord.ui.View):
 
                 async def send_to_guild(gid: int) -> None:
                     g = bot.get_guild(gid)
-                    if not g or not g.text_channels:
+                    if not g:
+                        return
+                    target_channel = None
+                    # Prefer configured notification channel
+                    conn3 = get_conn()
+                    try:
+                        ss = conn3.execute(
+                            "SELECT notification_channel_id FROM server_settings WHERE guild_id = ?",
+                            (gid,),
+                        ).fetchone()
+                    finally:
+                        conn3.close()
+                    if ss and ss["notification_channel_id"]:
+                        target_channel = g.get_channel(ss["notification_channel_id"])
+                    if target_channel is None and g.text_channels:
+                        target_channel = g.text_channels[0]
+                    if target_channel is None:
                         return
                     try:
-                        await g.text_channels[0].send(msg_text)
+                        await target_channel.send(msg_text)
                     except Exception:
                         pass
 
@@ -3814,8 +3834,8 @@ class RemindersView(discord.ui.View):
                         INSERT INTO events (
                             guild_id, creator_id, title, time, days,
                             remind_before_minutes, message, image_url, channel_id,
-                            created_at, is_paused
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                            created_at, is_paused, embed_color, ping_type
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                         """,
                         (
                             src["guild_id"], src["creator_id"],
@@ -3823,6 +3843,8 @@ class RemindersView(discord.ui.View):
                             int(src["remind_before_minutes"] or 10),
                             src["message"], src["image_url"], src["channel_id"],
                             dt.datetime.now().isoformat(),
+                            src["embed_color"],
+                            str(src["ping_type"] or "everyone"),
                         ),
                     )
                     conn2.commit()
