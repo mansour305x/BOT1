@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 DB_PATH = "events.db"
 CHECK_INTERVAL_SECONDS = 30
+BOT_OWNER_ID = 1376784524016619551
 
 # Predefined times (00:00 to 23:30 in 30-minute intervals)
 TIMES = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
@@ -215,6 +216,30 @@ def t(user_id: int, key: str, **kwargs) -> str:
     lang = get_user_lang(user_id)
     template = MESSAGES.get(lang, MESSAGES["en"]).get(key, key)
     return template.format(**kwargs)
+
+
+def is_bot_owner(user_id: int) -> bool:
+    return user_id == BOT_OWNER_ID
+
+
+def is_guild_admin(guild_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ).fetchone()
+        return bool(row)
+    finally:
+        conn.close()
+
+
+def has_guild_admin_access(guild_id: int, user_id: int, guild_owner_id: int) -> bool:
+    if is_bot_owner(user_id):
+        return True
+    if user_id == guild_owner_id:
+        return True
+    return is_guild_admin(guild_id, user_id)
 
 
 def validate_image_url(url: Optional[str]) -> bool:
@@ -1419,6 +1444,10 @@ class ControlPanelView(discord.ui.View):
 
             @discord.ui.button(label="View Registered | عرض المسجل", style=discord.ButtonStyle.secondary)
             async def view_registered(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+                    await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+                    return
+
                 conn = get_conn()
                 try:
                     rows = conn.execute(
@@ -1445,6 +1474,10 @@ class ControlPanelView(discord.ui.View):
 
             @discord.ui.button(label="Add Admin | إضافة مشرف", style=discord.ButtonStyle.secondary)
             async def add_admin(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+                    await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+                    return
+
                 class AdminModal(discord.ui.Modal, title="Add Admin"):
                     def __init__(self, parent_user_id: int, parent_guild_id: int):
                         super().__init__()
@@ -1482,8 +1515,231 @@ class ControlPanelView(discord.ui.View):
 
                 await inter.response.send_modal(AdminModal(self.parent_user_id, self.parent_guild_id))
 
+            @discord.ui.button(label="Owner Tools | أدوات المالك", style=discord.ButtonStyle.danger)
+            async def owner_tools(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not is_bot_owner(inter.user.id):
+                    await inter.response.send_message("هذه الأدوات خاصة بمالك البوت فقط.", ephemeral=True)
+                    return
+
+                class OwnerToolsView(discord.ui.View):
+                    def __init__(self, guild_id: int):
+                        super().__init__(timeout=300)
+                        self.guild_id = guild_id
+
+                    @discord.ui.button(label="Upgrade Bot | ترقية البوت", style=discord.ButtonStyle.success)
+                    async def upgrade_bot_owner(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        await owner_inter.response.defer(ephemeral=True, thinking=True)
+
+                        bot_dir = os.path.dirname(os.path.abspath(__file__)) or os.getcwd()
+                        git_proc = await asyncio.create_subprocess_exec(
+                            "git", "pull",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=bot_dir,
+                        )
+                        git_out, git_err = await git_proc.communicate()
+                        git_text = (git_out.decode().strip() or git_err.decode().strip())[:700]
+                        if git_proc.returncode != 0:
+                            await owner_inter.followup.send(f"Git pull failed:\n```\n{git_text}\n```", ephemeral=True)
+                            return
+
+                        pip_proc = await asyncio.create_subprocess_exec(
+                            sys.executable,
+                            "-m",
+                            "pip",
+                            "install",
+                            "-r",
+                            "requirements.txt",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            cwd=bot_dir,
+                        )
+                        pip_out, pip_err = await pip_proc.communicate()
+                        pip_text = (pip_out.decode().strip() or pip_err.decode().strip())[-700:]
+                        if pip_proc.returncode != 0:
+                            await owner_inter.followup.send(f"Pip install failed:\n```\n{pip_text}\n```", ephemeral=True)
+                            return
+
+                        await owner_inter.followup.send(
+                            f"تمت ترقية البوت بنجاح.\nGit:\n```\n{git_text}\n```\nPip (آخر سطور):\n```\n{pip_text}\n```\nسيتم إعادة التشغيل الآن...",
+                            ephemeral=True,
+                        )
+
+                        async def _restart() -> None:
+                            await asyncio.sleep(2)
+                            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+                        asyncio.create_task(_restart())
+
+                    @discord.ui.button(label="Add Bot Admin | إضافة أدمن", style=discord.ButtonStyle.primary)
+                    async def add_bot_admin(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        class OwnerAddAdminModal(discord.ui.Modal, title="Owner: Add Bot Admin"):
+                            def __init__(self, guild_id: int):
+                                super().__init__(timeout=300)
+                                self.guild_id = guild_id
+                                self.user_input = discord.ui.TextInput(
+                                    label="User ID",
+                                    placeholder="123456789012345678",
+                                    max_length=25,
+                                )
+                                self.add_item(self.user_input)
+
+                            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                                raw = self.user_input.value.strip()
+                                if not raw.isdigit():
+                                    await modal_inter.response.send_message("User ID غير صحيح.", ephemeral=True)
+                                    return
+
+                                user_id = int(raw)
+                                conn = get_conn()
+                                try:
+                                    conn.execute(
+                                        "INSERT OR IGNORE INTO admins (guild_id, user_id) VALUES (?, ?)",
+                                        (self.guild_id, user_id),
+                                    )
+                                    conn.commit()
+                                finally:
+                                    conn.close()
+
+                                await modal_inter.response.send_message(
+                                    f"تمت إضافة المستخدم `{user_id}` كأدمن للبوت في هذا السيرفر.",
+                                    ephemeral=True,
+                                )
+
+                        await owner_inter.response.send_modal(OwnerAddAdminModal(self.guild_id))
+
+                    @discord.ui.button(label="Remove Bot Admin | حذف أدمن", style=discord.ButtonStyle.secondary)
+                    async def remove_bot_admin(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        class OwnerRemoveAdminModal(discord.ui.Modal, title="Owner: Remove Bot Admin"):
+                            def __init__(self, guild_id: int):
+                                super().__init__(timeout=300)
+                                self.guild_id = guild_id
+                                self.user_input = discord.ui.TextInput(
+                                    label="User ID",
+                                    placeholder="123456789012345678",
+                                    max_length=25,
+                                )
+                                self.add_item(self.user_input)
+
+                            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                                raw = self.user_input.value.strip()
+                                if not raw.isdigit():
+                                    await modal_inter.response.send_message("User ID غير صحيح.", ephemeral=True)
+                                    return
+
+                                user_id = int(raw)
+                                conn = get_conn()
+                                try:
+                                    conn.execute(
+                                        "DELETE FROM admins WHERE guild_id = ? AND user_id = ?",
+                                        (self.guild_id, user_id),
+                                    )
+                                    conn.commit()
+                                finally:
+                                    conn.close()
+
+                                await modal_inter.response.send_message(
+                                    f"تم حذف المستخدم `{user_id}` من أدمن البوت في هذا السيرفر.",
+                                    ephemeral=True,
+                                )
+
+                        await owner_inter.response.send_modal(OwnerRemoveAdminModal(self.guild_id))
+
+                    @discord.ui.button(label="List Bot Admins | عرض الأدمن", style=discord.ButtonStyle.secondary)
+                    async def list_bot_admins(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        conn = get_conn()
+                        try:
+                            rows = conn.execute(
+                                "SELECT user_id FROM admins WHERE guild_id = ? ORDER BY user_id ASC",
+                                (self.guild_id,),
+                            ).fetchall()
+                        finally:
+                            conn.close()
+
+                        if not rows:
+                            await owner_inter.response.send_message("لا يوجد أدمن للبوت في هذا السيرفر.", ephemeral=True)
+                            return
+
+                        lines = ["Bot Admins:"]
+                        lines.extend(f"- <@{row['user_id']}> (`{row['user_id']}`)" for row in rows[:30])
+                        if len(rows) > 30:
+                            lines.append(f"... +{len(rows) - 30} more")
+                        await owner_inter.response.send_message("\n".join(lines), ephemeral=True)
+
+                    @discord.ui.button(label="Sync Commands | مزامنة الأوامر", style=discord.ButtonStyle.primary)
+                    async def sync_commands(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        await owner_inter.response.defer(ephemeral=True, thinking=True)
+                        synced = await bot.tree.sync()
+                        await owner_inter.followup.send(
+                            f"تمت مزامنة الأوامر بنجاح. عدد الأوامر: {len(synced)}",
+                            ephemeral=True,
+                        )
+
+                    @discord.ui.button(label="Add Link Button | إضافة زر جديد", style=discord.ButtonStyle.success)
+                    async def add_link_button(self, owner_inter: discord.Interaction, owner_btn: discord.ui.Button) -> None:
+                        class AddLinkButtonModal(discord.ui.Modal, title="Owner: Add Link Button"):
+                            def __init__(self):
+                                super().__init__(timeout=300)
+                                self.message_input = discord.ui.TextInput(
+                                    label="Message",
+                                    placeholder="اكتب رسالة الزر",
+                                    required=False,
+                                    default="اضغط الزر:",
+                                    max_length=200,
+                                )
+                                self.label_input = discord.ui.TextInput(
+                                    label="Button Label",
+                                    placeholder="مثال: موقعنا",
+                                    max_length=80,
+                                )
+                                self.url_input = discord.ui.TextInput(
+                                    label="Button URL",
+                                    placeholder="https://example.com",
+                                    max_length=200,
+                                )
+                                self.add_item(self.message_input)
+                                self.add_item(self.label_input)
+                                self.add_item(self.url_input)
+
+                            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                                if not modal_inter.channel:
+                                    await modal_inter.response.send_message("لا يمكن النشر في هذه القناة.", ephemeral=True)
+                                    return
+
+                                url = self.url_input.value.strip()
+                                if not (url.startswith("http://") or url.startswith("https://")):
+                                    await modal_inter.response.send_message("الرابط يجب أن يبدأ بـ http:// أو https://", ephemeral=True)
+                                    return
+
+                                link_view = discord.ui.View(timeout=None)
+                                link_view.add_item(
+                                    discord.ui.Button(
+                                        label=self.label_input.value.strip(),
+                                        style=discord.ButtonStyle.link,
+                                        url=url,
+                                    )
+                                )
+
+                                await modal_inter.channel.send(
+                                    content=self.message_input.value.strip() or "اضغط الزر:",
+                                    view=link_view,
+                                )
+                                await modal_inter.response.send_message("تم نشر الزر الجديد بنجاح.", ephemeral=True)
+
+                        await owner_inter.response.send_modal(AddLinkButtonModal())
+
+                await inter.response.send_message(
+                    "لوحة المالك الخاصة:\n- ترقية البوت\n- إدارة أدمن البوت\n- مزامنة الأوامر\n- إضافة زر رابط جديد",
+                    view=OwnerToolsView(self.parent_guild_id),
+                    ephemeral=True,
+                )
+
             @discord.ui.button(label="Register Server | تسجيل سيرفر", style=discord.ButtonStyle.primary)
             async def register_server(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+                    await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+                    return
+
                 class ServerIDModal(discord.ui.Modal, title="Register Server | تسجيل سيرفر"):
                     def __init__(self, parent_user_id: int):
                         super().__init__(timeout=300)
@@ -1660,17 +1916,7 @@ class ControlPanelView(discord.ui.View):
                     await inter.response.send_message("Server only.", ephemeral=True)
                     return
 
-                is_owner = inter.user.id == inter.guild.owner_id
-                conn = get_conn()
-                try:
-                    is_admin = conn.execute(
-                        "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
-                        (inter.guild.id, inter.user.id),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-                if not is_owner and not is_admin:
+                if not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
                     await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
                     return
 
@@ -1753,17 +1999,7 @@ class ControlPanelView(discord.ui.View):
                     await inter.response.send_message("Server only.", ephemeral=True)
                     return
 
-                is_owner = inter.user.id == inter.guild.owner_id
-                conn = get_conn()
-                try:
-                    is_admin = conn.execute(
-                        "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
-                        (inter.guild.id, inter.user.id),
-                    ).fetchone()
-                finally:
-                    conn.close()
-
-                if not is_owner and not is_admin:
+                if not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
                     await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
                     return
 
@@ -1861,17 +2097,7 @@ class ControlPanelView(discord.ui.View):
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
 
-        is_owner = interaction.user.id == interaction.guild.owner_id
-        conn = get_conn()
-        try:
-            is_admin = conn.execute(
-                "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
-                (interaction.guild.id, interaction.user.id),
-            ).fetchone()
-        finally:
-            conn.close()
-
-        if not is_owner and not is_admin:
+        if not has_guild_admin_access(interaction.guild.id, interaction.user.id, interaction.guild.owner_id):
             await interaction.response.send_message(
                 "Admins only. | للمشرفين فقط.", ephemeral=True
             )
@@ -1930,17 +2156,7 @@ async def setup(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Server only.", ephemeral=True)
         return
 
-    is_owner = interaction.user.id == interaction.guild.owner_id
-    conn = get_conn()
-    try:
-        is_admin = conn.execute(
-            "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
-            (interaction.guild.id, interaction.user.id),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if not is_owner and not is_admin:
+    if not has_guild_admin_access(interaction.guild.id, interaction.user.id, interaction.guild.owner_id):
         await interaction.response.send_message(
             "Admins only. | للمشرفين فقط.", ephemeral=True
         )
