@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 events.db
 bot.log
+.venv/
+bot_backup.py
