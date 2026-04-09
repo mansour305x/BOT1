@@ -174,6 +174,12 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("ALTER TABLE events ADD COLUMN last_sent_marker TEXT")
     if "channel_id" not in columns:
         conn.execute("ALTER TABLE events ADD COLUMN channel_id INTEGER")
+    if "is_paused" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0")
+    if "embed_color" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN embed_color TEXT")
+    if "ping_type" not in columns:
+        conn.execute("ALTER TABLE events ADD COLUMN ping_type TEXT NOT NULL DEFAULT 'everyone'")
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -194,6 +200,12 @@ def get_conn() -> sqlite3.Connection:
     ss_columns = {row["name"] for row in conn.execute("PRAGMA table_info(server_settings)").fetchall()}
     if "notification_channel_id" not in ss_columns:
         conn.execute("ALTER TABLE server_settings ADD COLUMN notification_channel_id INTEGER")
+    if "notification_role_id" not in ss_columns:
+        conn.execute("ALTER TABLE server_settings ADD COLUMN notification_role_id INTEGER")
+    if "default_embed_color" not in ss_columns:
+        conn.execute("ALTER TABLE server_settings ADD COLUMN default_embed_color TEXT")
+    if "default_ping_type" not in ss_columns:
+        conn.execute("ALTER TABLE server_settings ADD COLUMN default_ping_type TEXT NOT NULL DEFAULT 'everyone'")
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS admins (
@@ -246,6 +258,14 @@ def get_conn() -> sqlite3.Connection:
             default_channel_id INTEGER,
             default_remind_before INTEGER NOT NULL DEFAULT 10,
             PRIMARY KEY (user_id, guild_id)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_global_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
 
@@ -870,6 +890,12 @@ class ReminderBot(commands.Bot):
                 except Exception:
                     continue
 
+                try:
+                    if int(row["is_paused"] or 0):
+                        continue
+                except Exception:
+                    pass
+
                 remind_before = int(row["remind_before_minutes"] or 10)
 
                 days_raw = str(row["days"] or "")
@@ -915,6 +941,12 @@ class ReminderBot(commands.Bot):
         await self.wait_until_ready()
 
     async def send_event_reminder(self, row: sqlite3.Row) -> None:
+        try:
+            if int(row["is_paused"] or 0):
+                return
+        except Exception:
+            pass
+
         guild = self.get_guild(row["guild_id"])
         if not guild:
             logging.warning(f"Guild {row['guild_id']} not found")
@@ -923,9 +955,16 @@ class ReminderBot(commands.Bot):
         lang = get_user_lang(row["creator_id"])
         msg_dict = MESSAGES.get(lang, MESSAGES["en"])
 
+        embed_color = discord.Color.blurple()
+        try:
+            if row["embed_color"]:
+                embed_color = discord.Color(int(str(row["embed_color"]), 16))
+        except Exception:
+            pass
+
         embed = discord.Embed(
             title=msg_dict["event_reminder_title"],
-            color=discord.Color.blurple(),
+            color=embed_color,
         )
         embed.add_field(name=msg_dict["event_field_name"], value=row["title"], inline=False)
         if row["message"]:
@@ -936,13 +975,26 @@ class ReminderBot(commands.Bot):
         conn = get_conn()
         try:
             settings = conn.execute(
-                "SELECT notification_channel_id FROM server_settings WHERE guild_id = ?",
+                "SELECT notification_channel_id, notification_role_id FROM server_settings WHERE guild_id = ?",
                 (row["guild_id"],),
             ).fetchone()
         finally:
             conn.close()
 
-        mention = "@everyone"
+        try:
+            ping_type = str(row["ping_type"] or "everyone")
+        except Exception:
+            ping_type = "everyone"
+
+        if ping_type == "everyone":
+            mention = "@everyone"
+        elif ping_type == "here":
+            mention = "@here"
+        elif ping_type == "role":
+            role_id = settings["notification_role_id"] if settings and settings["notification_role_id"] else None
+            mention = f"<@&{role_id}>" if role_id else "@everyone"
+        else:
+            mention = ""
 
         channel = None
         if row["channel_id"]:
@@ -953,7 +1005,11 @@ class ReminderBot(commands.Bot):
             channel = guild.text_channels[0] if guild.text_channels else None
         if channel:
             try:
-                await channel.send(content=mention, embed=embed, allowed_mentions=discord.AllowedMentions(everyone=True))
+                await channel.send(
+                    content=mention,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(everyone=True, roles=True),
+                )
                 logging.info(f"Reminder sent for event #{row['id']}")
             except Exception as e:
                 logging.error(f"Failed to send reminder: {e}")
@@ -2854,6 +2910,195 @@ class OwnerServerSettingsView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(label="🚀 أدوات متقدمة | Advanced Tools", style=discord.ButtonStyle.danger)
+    async def advanced_tools_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            bi_text("🚀 الأدوات المتقدمة لمالك البوت:", "🚀 Owner advanced tools:"),
+            view=OwnerAdvancedView(owner_id=interaction.user.id, guild_id=self.guild_id),
+            ephemeral=True,
+        )
+
+
+class OwnerAdvancedView(discord.ui.View):
+    """Advanced tools for bot owner."""
+
+    def __init__(self, owner_id: int, guild_id: int) -> None:
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id or not is_bot_owner(interaction.user.id):
+            await interaction.response.send_message("هذه اللوحة لمالك البوت فقط.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="📊 إحصائيات البوت | Bot Statistics", style=discord.ButtonStyle.primary, row=0)
+    async def bot_stats_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        conn = get_conn()
+        try:
+            total_events = conn.execute("SELECT COUNT(*) as cnt FROM events").fetchone()["cnt"]
+            paused_events = conn.execute("SELECT COUNT(*) as cnt FROM events WHERE is_paused = 1").fetchone()["cnt"]
+            total_registered = conn.execute("SELECT COUNT(*) as cnt FROM registered_servers").fetchone()["cnt"]
+            distinct_creators = conn.execute("SELECT COUNT(DISTINCT creator_id) as cnt FROM events").fetchone()["cnt"]
+        finally:
+            conn.close()
+
+        total_guilds = len(bot.guilds)
+        await interaction.response.send_message(
+            f"**📊 {bi_text('إحصائيات البوت', 'Bot Statistics')}:**\n"
+            f"🌐 {bi_text('السيرفرات الكلية', 'Total guilds')}: **{total_guilds}**\n"
+            f"📝 {bi_text('السيرفرات المسجلة', 'Registered servers')}: **{total_registered}**\n"
+            f"📋 {bi_text('التذكيرات الكلية', 'Total reminders')}: **{total_events}**\n"
+            f"⏸️ {bi_text('التذكيرات الموقوفة', 'Paused reminders')}: **{paused_events}**\n"
+            f"👥 {bi_text('مستخدمون لديهم تذكيرات', 'Users with reminders')}: **{distinct_creators}**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📣 رسالة جماعية | Broadcast", style=discord.ButtonStyle.primary, row=0)
+    async def broadcast_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        class BroadcastModal(discord.ui.Modal, title="Broadcast Message"):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+                self.msg_input = discord.ui.TextInput(
+                    label="Message",
+                    style=discord.TextStyle.paragraph,
+                    max_length=1800,
+                )
+                self.add_item(self.msg_input)
+
+            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                await modal_inter.response.defer(ephemeral=True, thinking=True)
+                msg_text = self.msg_input.value.strip()
+
+                conn2 = get_conn()
+                try:
+                    reg_rows = conn2.execute("SELECT guild_id FROM registered_servers").fetchall()
+                finally:
+                    conn2.close()
+
+                async def send_to_guild(gid: int) -> None:
+                    g = bot.get_guild(gid)
+                    if not g or not g.text_channels:
+                        return
+                    try:
+                        await g.text_channels[0].send(msg_text)
+                    except Exception:
+                        pass
+
+                tasks = [send_to_guild(int(r["guild_id"])) for r in reg_rows]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await modal_inter.followup.send(
+                    f"✅ {bi_text('تم إرسال الرسالة إلى', 'Message sent to')} {len(reg_rows)} {bi_text('سيرفر', 'servers')}.",
+                    ephemeral=True,
+                )
+
+        await interaction.response.send_modal(BroadcastModal())
+
+    @discord.ui.button(label="🎭 حالة البوت | Bot Status", style=discord.ButtonStyle.secondary, row=0)
+    async def bot_status_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        class StatusModal(discord.ui.Modal, title="Set Bot Status"):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+                self.activity_type = discord.ui.TextInput(
+                    label="Activity Type (playing/watching/listening)",
+                    placeholder="playing",
+                    max_length=20,
+                    default="playing",
+                )
+                self.activity_text = discord.ui.TextInput(
+                    label="Activity Text",
+                    placeholder="with reminders",
+                    max_length=128,
+                )
+                self.add_item(self.activity_type)
+                self.add_item(self.activity_text)
+
+            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                atype = self.activity_type.value.strip().lower()
+                atext = self.activity_text.value.strip()
+                if atype == "watching":
+                    activity = discord.Activity(type=discord.ActivityType.watching, name=atext)
+                elif atype == "listening":
+                    activity = discord.Activity(type=discord.ActivityType.listening, name=atext)
+                else:
+                    activity = discord.Game(name=atext)
+                await bot.change_presence(activity=activity)
+                await modal_inter.response.send_message(
+                    f"✅ {bi_text('تم تعيين الحالة', 'Status set')}: {atype} {atext}",
+                    ephemeral=True,
+                )
+
+        await interaction.response.send_modal(StatusModal())
+
+    @discord.ui.button(label="📋 عرض كل التذكيرات | All Reminders", style=discord.ButtonStyle.secondary, row=0)
+    async def all_reminders_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        conn = get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, guild_id, creator_id, title, time, days FROM events ORDER BY guild_id, time LIMIT 20"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await interaction.response.send_message(bi_text("لا توجد تذكيرات.", "No reminders found."), ephemeral=True)
+            return
+
+        lines = [f"**{bi_text('التذكيرات (أول 20)', 'Reminders (first 20)')}:**"]
+        for row in rows:
+            lines.append(f"• #{row['id']} | GID:{row['guild_id']} | {row['title'][:30]} | {row['time']}")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="🌐 رسالة افتراضية | Default Template", style=discord.ButtonStyle.secondary, row=1)
+    async def global_template_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        class TemplateModal(discord.ui.Modal, title="Global Default Message Template"):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+                self.template_input = discord.ui.TextInput(
+                    label="Template",
+                    style=discord.TextStyle.paragraph,
+                    required=False,
+                    max_length=500,
+                )
+                self.add_item(self.template_input)
+
+            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                template = self.template_input.value.strip() or ""
+                conn2 = get_conn()
+                try:
+                    conn2.execute(
+                        """
+                        INSERT INTO bot_global_settings (key, value, updated_at)
+                        VALUES ('default_message_template', ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                        """,
+                        (template, dt.datetime.now().isoformat()),
+                    )
+                    conn2.commit()
+                finally:
+                    conn2.close()
+                await modal_inter.response.send_message(
+                    f"✅ {bi_text('تم تعيين القالب الافتراضي.', 'Default template set.')}",
+                    ephemeral=True,
+                )
+
+        await interaction.response.send_modal(TemplateModal())
+
+    @discord.ui.button(label="🔄 إعادة تشغيل | Force Restart", style=discord.ButtonStyle.danger, row=1)
+    async def force_restart_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            bi_text("⚠️ سيتم إعادة تشغيل البوت خلال ثانيتين...", "⚠️ Bot will restart in 2 seconds..."),
+            ephemeral=True,
+        )
+
+        async def _restart() -> None:
+            await asyncio.sleep(2)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        asyncio.create_task(_restart())
+
 
 class MainPanelView(discord.ui.View):
     def __init__(self, owner_id: int):
@@ -2978,20 +3223,23 @@ class MainPanelView(discord.ui.View):
                     await inter.followup.send("ليست صورة.", ephemeral=True)
                     return
 
+                captured_owner_id = self.owner_id
+                captured_event_id = self.event_row["id"]
+
                 class ConfirmImageView(discord.ui.View):
                     def __init__(self):
                         super().__init__(timeout=60)
 
                     @discord.ui.button(label="✅ تأكيد | Confirm", style=discord.ButtonStyle.success)
                     async def confirm_image(self, conf_inter: discord.Interaction, btn: discord.ui.Button) -> None:
-                        if conf_inter.user.id != self.owner_id:
+                        if conf_inter.user.id != captured_owner_id:
                             await conf_inter.response.send_message("Not for you.", ephemeral=True)
                             return
                         conn2 = get_conn()
                         try:
                             conn2.execute(
                                 "UPDATE events SET image_url = ? WHERE id = ? AND creator_id = ?",
-                                (attachment.url, self.event_row["id"], self.owner_id),
+                                (attachment.url, captured_event_id, captured_owner_id),
                             )
                             conn2.commit()
                         finally:
@@ -3000,7 +3248,7 @@ class MainPanelView(discord.ui.View):
 
                     @discord.ui.button(label="❌ إلغاء | Cancel", style=discord.ButtonStyle.danger)
                     async def cancel_image(self, conf_inter: discord.Interaction, btn: discord.ui.Button) -> None:
-                        if conf_inter.user.id != self.owner_id:
+                        if conf_inter.user.id != captured_owner_id:
                             await conf_inter.response.send_message("Not for you.", ephemeral=True)
                             return
                         await conf_inter.response.edit_message(content="تم إلغاء الرفع.", view=None)
@@ -3036,7 +3284,7 @@ class MainPanelView(discord.ui.View):
                         )
 
                     async def callback(self, sel_inter: discord.Interaction) -> None:
-                        if sel_inter.user.id != self.owner_id:
+                        if sel_inter.user.id != self.view.owner_id:
                             await sel_inter.response.send_message("Not for you.", ephemeral=True)
                             return
 
@@ -3047,7 +3295,7 @@ class MainPanelView(discord.ui.View):
                         try:
                             conn2.execute(
                                 "UPDATE events SET channel_id = ? WHERE id = ? AND creator_id = ?",
-                                (new_channel_id, self.event_row["id"], self.owner_id),
+                                (new_channel_id, self.view.event_id, self.view.owner_id),
                             )
                             conn2.commit()
                         finally:
@@ -3060,13 +3308,15 @@ class MainPanelView(discord.ui.View):
                         )
 
                 class EventChannelSelectView(discord.ui.View):
-                    def __init__(self):
+                    def __init__(self, owner_id: int, event_id: int):
                         super().__init__(timeout=300)
+                        self.owner_id = owner_id
+                        self.event_id = event_id
                         self.add_item(EventChannelSelect())
 
                 await inter.response.edit_message(
                     content="اختر القناة:",
-                    view=EventChannelSelectView(),
+                    view=EventChannelSelectView(self.owner_id, self.event_row["id"]),
                 )
 
             @discord.ui.button(label="حذف | Delete", style=discord.ButtonStyle.danger)
@@ -3296,9 +3546,11 @@ class RemindersView(discord.ui.View):
             async def edit_schedule_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.send_modal(
                     EditScheduleModal(
-                        self.selected_event["id"],
-                        self.selected_event["time"],
-                        self.selected_event["days"],
+                        event_id=self.selected_event["id"],
+                        current_title=self.selected_event["title"],
+                        current_time=self.selected_event["time"],
+                        current_days=self.selected_event["days"],
+                        current_remind_before=int(self.selected_event["remind_before_minutes"]),
                     )
                 )
 
@@ -3343,6 +3595,81 @@ class RemindersView(discord.ui.View):
                     ephemeral=True,
                 )
 
+            @discord.ui.button(label="📢 تعديل القناة | Channel", style=discord.ButtonStyle.primary, row=0)
+            async def edit_channel_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild:
+                    await inter.response.send_message(bi_text("للخادم فقط.", "Server only."), ephemeral=True)
+                    return
+
+                text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
+                ev_id = self.selected_event["id"]
+
+                class EvChSelect(discord.ui.Select):
+                    def __init__(self):
+                        options = [discord.SelectOption(label=bi_text("القناة الافتراضية", "Default channel"), value="default")]
+                        options.extend(
+                            discord.SelectOption(label=f"#{ch.name}"[:100], value=str(ch.id))
+                            for ch in text_channels[:24]
+                        )
+                        super().__init__(placeholder=bi_text("اختر القناة", "Select channel"), options=options, min_values=1, max_values=1)
+
+                    async def callback(self, sel_inter: discord.Interaction) -> None:
+                        if sel_inter.user.id != owner_id:
+                            await sel_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
+                            return
+                        selected = self.values[0]
+                        new_ch_id = None if selected == "default" else int(selected)
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE events SET channel_id = ? WHERE id = ? AND creator_id = ?",
+                                (new_ch_id, ev_id, owner_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                        ch_label = f"<#{new_ch_id}>" if new_ch_id else bi_text("الافتراضية", "Default")
+                        await sel_inter.response.edit_message(
+                            content=f"✅ {bi_text('تم تحديث القناة', 'Channel updated')}: {ch_label}",
+                            view=None,
+                        )
+
+                class EvChSelectView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=300)
+                        self.add_item(EvChSelect())
+
+                await inter.response.edit_message(
+                    content=bi_text("اختر القناة الجديدة لهذا التذكير:", "Choose new channel for this reminder:"),
+                    view=EvChSelectView(),
+                )
+
+            @discord.ui.button(label="⏸️ إيقاف | Pause", style=discord.ButtonStyle.secondary, row=0)
+            async def pause_resume_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                conn2 = get_conn()
+                try:
+                    current_row = conn2.execute(
+                        "SELECT is_paused FROM events WHERE id = ? AND creator_id = ?",
+                        (self.selected_event["id"], owner_id),
+                    ).fetchone()
+                    if not current_row:
+                        await inter.response.send_message(bi_text("التذكير غير موجود.", "Reminder not found."), ephemeral=True)
+                        return
+                    new_paused = 0 if int(current_row["is_paused"] or 0) else 1
+                    conn2.execute(
+                        "UPDATE events SET is_paused = ? WHERE id = ? AND creator_id = ?",
+                        (new_paused, self.selected_event["id"], owner_id),
+                    )
+                    conn2.commit()
+                finally:
+                    conn2.close()
+
+                if new_paused:
+                    msg = bi_text("⏸️ تم إيقاف التذكير مؤقتاً.", "⏸️ Reminder paused.")
+                else:
+                    msg = bi_text("▶️ تم تفعيل التذكير.", "▶️ Reminder resumed.")
+                await inter.response.send_message(msg, ephemeral=True)
+
             @discord.ui.button(label="🧪 اختبار موعد التذكير | Test Reminder", style=discord.ButtonStyle.primary, row=1)
             async def test_event_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.defer(ephemeral=True, thinking=True)
@@ -3357,6 +3684,151 @@ class RemindersView(discord.ui.View):
 
                 await inter.followup.send(
                     bi_text("✅ تم إرسال تذكير تجريبي لهذا الموعد.", "✅ Test reminder sent for this schedule."),
+                    ephemeral=True,
+                )
+
+            @discord.ui.button(label="🎨 لون التذكير | Color", style=discord.ButtonStyle.secondary, row=1)
+            async def color_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                ev_id = self.selected_event["id"]
+
+                class ColorSelectView(discord.ui.View):
+                    def __init__(self) -> None:
+                        super().__init__(timeout=300)
+
+                        def make_color_cb(hex_val: str, color_label: str):
+                            async def color_cb(color_inter: discord.Interaction) -> None:
+                                if color_inter.user.id != owner_id:
+                                    await color_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
+                                    return
+                                conn2 = get_conn()
+                                try:
+                                    conn2.execute(
+                                        "UPDATE events SET embed_color = ? WHERE id = ? AND creator_id = ?",
+                                        (hex_val, ev_id, owner_id),
+                                    )
+                                    conn2.commit()
+                                finally:
+                                    conn2.close()
+                                await color_inter.response.edit_message(
+                                    content=f"✅ {bi_text('تم تعيين اللون', 'Color set')}: {color_label}",
+                                    view=None,
+                                )
+                            return color_cb
+
+                        for idx, (clabel, chex, cemoji) in enumerate(COLOR_PRESETS):
+                            cb = discord.ui.Button(label=f"{cemoji} {clabel}", style=discord.ButtonStyle.secondary, row=idx // 5)
+                            cb.callback = make_color_cb(chex, clabel)
+                            self.add_item(cb)
+
+                        async def reset_color(reset_inter: discord.Interaction) -> None:
+                            if reset_inter.user.id != owner_id:
+                                await reset_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
+                                return
+                            conn2 = get_conn()
+                            try:
+                                conn2.execute(
+                                    "UPDATE events SET embed_color = NULL WHERE id = ? AND creator_id = ?",
+                                    (ev_id, owner_id),
+                                )
+                                conn2.commit()
+                            finally:
+                                conn2.close()
+                            await reset_inter.response.edit_message(
+                                content=bi_text("✅ تم إعادة اللون الافتراضي.", "✅ Reset to default color."),
+                                view=None,
+                            )
+
+                        reset_btn = discord.ui.Button(
+                            label=bi_text("🔄 اللون الافتراضي | Default Color", "🔄 Default Color"),
+                            style=discord.ButtonStyle.danger,
+                            row=2,
+                        )
+                        reset_btn.callback = reset_color
+                        self.add_item(reset_btn)
+
+                await inter.response.edit_message(
+                    content=bi_text("اختر لون الإمبد لهذا التذكير:", "Choose embed color for this reminder:"),
+                    view=ColorSelectView(),
+                )
+
+            @discord.ui.button(label="🔔 نوع التنبيه | Ping", style=discord.ButtonStyle.secondary, row=1)
+            async def ping_type_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                ev_id = self.selected_event["id"]
+
+                class PingTypeView(discord.ui.View):
+                    def __init__(self) -> None:
+                        super().__init__(timeout=300)
+
+                    async def interaction_check(self, ping_inter: discord.Interaction) -> bool:
+                        if ping_inter.user.id != owner_id:
+                            await ping_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
+                            return False
+                        return True
+
+                    async def _set_ping(self, ping_inter: discord.Interaction, ptype: str, label: str) -> None:
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE events SET ping_type = ? WHERE id = ? AND creator_id = ?",
+                                (ptype, ev_id, owner_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                        await ping_inter.response.edit_message(
+                            content=f"✅ {bi_text('نوع التنبيه', 'Ping type')}: **{label}**",
+                            view=None,
+                        )
+
+                    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.primary)
+                    async def everyone_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                        await self._set_ping(pi, "everyone", "@everyone")
+
+                    @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary)
+                    async def here_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                        await self._set_ping(pi, "here", "@here")
+
+                    @discord.ui.button(label=bi_text("الرول | Role", "Role"), style=discord.ButtonStyle.secondary)
+                    async def role_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                        await self._set_ping(pi, "role", bi_text("الرول", "Role"))
+
+                    @discord.ui.button(label=bi_text("صامت | None", "None"), style=discord.ButtonStyle.danger)
+                    async def none_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                        await self._set_ping(pi, "none", bi_text("صامت", "None"))
+
+                await inter.response.edit_message(
+                    content=bi_text("اختر نوع التنبيه لهذا التذكير:", "Choose ping type for this reminder:"),
+                    view=PingTypeView(),
+                )
+
+            @discord.ui.button(label="📋 تكرار | Duplicate", style=discord.ButtonStyle.secondary, row=1)
+            async def duplicate_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                src = self.selected_event
+                conn2 = get_conn()
+                try:
+                    cursor = conn2.execute(
+                        """
+                        INSERT INTO events (
+                            guild_id, creator_id, title, time, days,
+                            remind_before_minutes, message, image_url, channel_id,
+                            created_at, is_paused
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        """,
+                        (
+                            src["guild_id"], src["creator_id"],
+                            f"{src['title']} (copy)", src["time"], src["days"],
+                            int(src["remind_before_minutes"] or 10),
+                            src["message"], src["image_url"], src["channel_id"],
+                            dt.datetime.now().isoformat(),
+                        ),
+                    )
+                    conn2.commit()
+                    new_id = cursor.lastrowid
+                finally:
+                    conn2.close()
+
+                await inter.response.send_message(
+                    f"✅ {bi_text('تم نسخ التذكير', 'Reminder duplicated')}. {bi_text('المعرّف الجديد', 'New ID')}: **{new_id}**",
                     ephemeral=True,
                 )
 
@@ -4029,6 +4501,172 @@ class SettingsView(discord.ui.View):
         await inter.response.send_message(
             f"📞 **{bi_text('التواصل مع الدعم', 'Support contact')}:**\n{bi_text('اضغط على الزر أدناه للتواصل مع DANGER_600', 'Press the button below to contact DANGER_600')}",
             view=support_view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔔 رول التنبيهات | Notification Role", style=discord.ButtonStyle.primary, row=2)
+    async def notif_role_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+        if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+            await inter.response.send_message(bi_text("للمشرفين فقط.", "Admins only."), ephemeral=True)
+            return
+
+        guild_id = self.guild_id
+
+        class RoleSelectView(discord.ui.View):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+                role_select = discord.ui.RoleSelect(
+                    placeholder=bi_text("اختر الرول | Select Role", "Select notification role"),
+                    min_values=0,
+                    max_values=1,
+                )
+
+                async def role_callback(rs_inter: discord.Interaction) -> None:
+                    if rs_inter.user.id != inter.user.id:
+                        await rs_inter.response.send_message(bi_text("ليس لك.", "Not for you."), ephemeral=True)
+                        return
+                    role_id = (rs_inter.data.get("values") or [None])[0]
+                    conn2 = get_conn()
+                    try:
+                        conn2.execute(
+                            "UPDATE server_settings SET notification_role_id = ? WHERE guild_id = ?",
+                            (int(role_id) if role_id else None, guild_id),
+                        )
+                        conn2.commit()
+                    finally:
+                        conn2.close()
+                    label = f"<@&{role_id}>" if role_id else bi_text("تم مسح الرول", "Role cleared")
+                    await rs_inter.response.edit_message(
+                        content=f"✅ {bi_text('رول التنبيهات', 'Notification role')}: {label}",
+                        view=None,
+                    )
+
+                role_select.callback = role_callback
+                self.add_item(role_select)
+
+        await inter.response.send_message(
+            bi_text("اختر رول التنبيهات للسيرفر:", "Choose notification role for the server:"),
+            view=RoleSelectView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🎨 لون الإمبد الافتراضي | Default Color", style=discord.ButtonStyle.secondary, row=2)
+    async def default_color_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+        if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+            await inter.response.send_message(bi_text("للمشرفين فقط.", "Admins only."), ephemeral=True)
+            return
+
+        guild_id = self.guild_id
+
+        class DefColorView(discord.ui.View):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+
+                def make_color_cb(hex_val: str, color_label: str):
+                    async def color_cb(color_inter: discord.Interaction) -> None:
+                        conn2 = get_conn()
+                        try:
+                            conn2.execute(
+                                "UPDATE server_settings SET default_embed_color = ? WHERE guild_id = ?",
+                                (hex_val, guild_id),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+                        await color_inter.response.edit_message(
+                            content=f"✅ {bi_text('اللون الافتراضي للسيرفر', 'Server default color')}: {color_label}",
+                            view=None,
+                        )
+                    return color_cb
+
+                for idx, (clabel, chex, cemoji) in enumerate(COLOR_PRESETS):
+                    cb = discord.ui.Button(label=f"{cemoji} {clabel}", style=discord.ButtonStyle.secondary, row=idx // 5)
+                    cb.callback = make_color_cb(chex, clabel)
+                    self.add_item(cb)
+
+        await inter.response.send_message(
+            bi_text("اختر اللون الافتراضي للسيرفر:", "Choose server default embed color:"),
+            view=DefColorView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔔 نوع التنبيه الافتراضي | Default Ping", style=discord.ButtonStyle.secondary, row=2)
+    async def default_ping_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+        if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+            await inter.response.send_message(bi_text("للمشرفين فقط.", "Admins only."), ephemeral=True)
+            return
+
+        guild_id = self.guild_id
+
+        class DefPingView(discord.ui.View):
+            def __init__(self) -> None:
+                super().__init__(timeout=300)
+
+            async def _set_ping(self, pi: discord.Interaction, ptype: str, label: str) -> None:
+                conn2 = get_conn()
+                try:
+                    conn2.execute(
+                        "UPDATE server_settings SET default_ping_type = ? WHERE guild_id = ?",
+                        (ptype, guild_id),
+                    )
+                    conn2.commit()
+                finally:
+                    conn2.close()
+                await pi.response.edit_message(
+                    content=f"✅ {bi_text('نوع التنبيه الافتراضي', 'Default ping type')}: **{label}**",
+                    view=None,
+                )
+
+            @discord.ui.button(label="@everyone", style=discord.ButtonStyle.primary)
+            async def ev_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                await self._set_ping(pi, "everyone", "@everyone")
+
+            @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary)
+            async def here_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                await self._set_ping(pi, "here", "@here")
+
+            @discord.ui.button(label=bi_text("الرول | Role", "Role"), style=discord.ButtonStyle.secondary)
+            async def role_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                await self._set_ping(pi, "role", bi_text("الرول", "Role"))
+
+            @discord.ui.button(label=bi_text("صامت | None", "None"), style=discord.ButtonStyle.danger)
+            async def none_btn(self, pi: discord.Interaction, b: discord.ui.Button) -> None:
+                await self._set_ping(pi, "none", bi_text("صامت", "None"))
+
+        await inter.response.send_message(
+            bi_text("اختر نوع التنبيه الافتراضي للسيرفر:", "Choose server default ping type:"),
+            view=DefPingView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="📊 إحصائيات | Statistics", style=discord.ButtonStyle.secondary, row=2)
+    async def stats_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+        if not inter.guild or not has_guild_admin_access(inter.guild.id, inter.user.id, inter.guild.owner_id):
+            await inter.response.send_message(bi_text("للمشرفين فقط.", "Admins only."), ephemeral=True)
+            return
+
+        conn2 = get_conn()
+        try:
+            total_reminders = conn2.execute(
+                "SELECT COUNT(*) as cnt FROM events WHERE guild_id = ?",
+                (inter.guild.id,),
+            ).fetchone()["cnt"]
+            total_admins = conn2.execute(
+                "SELECT COUNT(*) as cnt FROM admins WHERE guild_id = ?",
+                (inter.guild.id,),
+            ).fetchone()["cnt"]
+            is_reg = bool(conn2.execute(
+                "SELECT 1 FROM registered_servers WHERE guild_id = ?",
+                (inter.guild.id,),
+            ).fetchone())
+        finally:
+            conn2.close()
+
+        await inter.response.send_message(
+            f"**📊 {bi_text('إحصائيات السيرفر', 'Server Statistics')}:**\n"
+            f"📋 {bi_text('التذكيرات الكلية', 'Total reminders')}: **{total_reminders}**\n"
+            f"👥 {bi_text('المشرفون', 'Admins')}: **{total_admins}**\n"
+            f"✅ {bi_text('مسجل في البوت', 'Registered in bot')}: **{'نعم' if is_reg else 'لا'}**",
             ephemeral=True,
         )
 
