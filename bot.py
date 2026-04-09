@@ -21,6 +21,18 @@ CHECK_INTERVAL_SECONDS = 30
 TIMES = [f"{h:02d}:{m:02d}" for h in range(24) for m in (0, 30)]
 REMINDER_MINUTES_OPTIONS = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
 
+COLOR_PRESETS = [
+    ("أحمر", "FF4D4D", "🔴"),
+    ("برتقالي", "FF8C42", "🟠"),
+    ("أصفر", "FFD93D", "🟡"),
+    ("أخضر", "4CD964", "🟢"),
+    ("أزرق", "3498DB", "🔵"),
+    ("بنفسجي", "9B59B6", "🟣"),
+    ("وردي", "FF69B4", "🩷"),
+    ("أبيض", "ECF0F1", "⚪"),
+    ("أسود", "2C3E50", "⚫"),
+]
+
 # Values are based on Python weekday(): Monday=0 ... Sunday=6
 DAY_NAME_BY_VALUE = {
     "0": "الاثنين",
@@ -149,6 +161,17 @@ def get_conn() -> sqlite3.Connection:
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS color_roles (
+            guild_id INTEGER NOT NULL,
+            role_id INTEGER NOT NULL,
+            color_hex TEXT NOT NULL,
+            label TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            PRIMARY KEY (guild_id, role_id)
+        )
+    """)
     
     conn.commit()
     return conn
@@ -185,6 +208,216 @@ def validate_image_url(url: Optional[str]) -> bool:
     if url is None or url == "":
         return True
     return url.startswith("http://") or url.startswith("https://")
+
+
+async def ensure_color_roles(guild: discord.Guild):
+    conn = get_conn()
+    ensured_map = {}
+    try:
+        for label, color_hex, emoji in COLOR_PRESETS:
+            row = conn.execute(
+                "SELECT role_id FROM color_roles WHERE guild_id = ? AND color_hex = ?",
+                (guild.id, color_hex),
+            ).fetchone()
+
+            role = guild.get_role(row["role_id"]) if row else None
+            if role is None:
+                role = await guild.create_role(
+                    name=f"Color | {label}",
+                    colour=discord.Colour(int(color_hex, 16)),
+                    mentionable=False,
+                    reason="Create color role panel roles",
+                )
+
+            conn.execute(
+                """
+                INSERT INTO color_roles (guild_id, role_id, color_hex, label, emoji)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, role_id) DO UPDATE SET
+                    color_hex = excluded.color_hex,
+                    label = excluded.label,
+                    emoji = excluded.emoji
+                """,
+                (guild.id, role.id, color_hex, label, emoji),
+            )
+            ensured_map[role.id] = (role.id, label, emoji)
+
+        # Include custom colors that were added later from settings.
+        custom_rows = conn.execute(
+            "SELECT role_id, label, emoji FROM color_roles WHERE guild_id = ?",
+            (guild.id,),
+        ).fetchall()
+        for row in custom_rows:
+            role = guild.get_role(row["role_id"])
+            if role is not None:
+                ensured_map[row["role_id"]] = (row["role_id"], row["label"], row["emoji"])
+
+        conn.commit()
+        return list(ensured_map.values())
+    finally:
+        conn.close()
+
+
+def build_color_picker_view(guild_id: int, role_entries):
+    view = discord.ui.View(timeout=None)
+
+    for idx, (role_id, label, emoji) in enumerate(role_entries):
+        btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            emoji=emoji,
+            custom_id=f"pick-color:{guild_id}:{role_id}",
+            row=idx // 5,
+        )
+
+        async def on_click(interaction: discord.Interaction, selected_role_id=role_id, selected_label=label):
+            if not interaction.guild or interaction.guild.id != guild_id:
+                await interaction.response.send_message("هذه اللوحة لا تخص هذا السيرفر.", ephemeral=True)
+                return
+
+            member = interaction.guild.get_member(interaction.user.id)
+            if member is None:
+                try:
+                    member = await interaction.guild.fetch_member(interaction.user.id)
+                except Exception:
+                    await interaction.response.send_message("لم أستطع العثور على العضو.", ephemeral=True)
+                    return
+
+            selected_role = interaction.guild.get_role(selected_role_id)
+            if selected_role is None:
+                await interaction.response.send_message("الرول المحدد غير موجود.", ephemeral=True)
+                return
+
+            move_warning = None
+            bot_member = interaction.guild.me
+            if bot_member and bot_member.top_role.position > 1:
+                target_position = bot_member.top_role.position - 1
+                if selected_role.position < target_position:
+                    try:
+                        await selected_role.edit(position=target_position, reason="Color role priority")
+                    except Exception as e:
+                        move_warning = f"تعذر رفع رتبة اللون تلقائيًا: {e}"
+
+            # Remove any existing manageable colored role so selected color is applied immediately.
+            remove_roles = []
+            not_manageable_colored_roles = []
+            for r in member.roles:
+                if r.is_default() or r.id == selected_role_id:
+                    continue
+                if r.colour.value == 0:
+                    continue
+
+                # Bot can only manage roles lower than its top role.
+                if bot_member and r.position < bot_member.top_role.position and not r.managed:
+                    remove_roles.append(r)
+                else:
+                    not_manageable_colored_roles.append(r)
+
+            try:
+                if remove_roles:
+                    await member.remove_roles(*remove_roles, reason="Switch color role")
+                if selected_role not in member.roles:
+                    await member.add_roles(selected_role, reason="Pick color role")
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "لا أملك صلاحية تعديل الرتب. تأكد أن رتبة البوت أعلى من رتب الألوان.",
+                    ephemeral=True,
+                )
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"فشل تغيير اللون: {e}", ephemeral=True)
+                return
+
+            # Re-fetch member and verify effective color role shown in Discord.
+            try:
+                member = await interaction.guild.fetch_member(interaction.user.id)
+            except Exception:
+                member = interaction.guild.get_member(interaction.user.id) or member
+
+            effective_color_role = None
+            for r in sorted(member.roles, key=lambda x: x.position, reverse=True):
+                if r.colour.value != 0:
+                    effective_color_role = r
+                    break
+
+            if effective_color_role and effective_color_role.id != selected_role_id:
+                note = (
+                    f"تمت إضافة اللون {selected_label} لكن اللون الظاهر يتحكم فيه رول أعلى: "
+                    f"**{effective_color_role.name}**."
+                )
+                if not_manageable_colored_roles:
+                    locked = ", ".join(r.name for r in not_manageable_colored_roles[:3])
+                    note += f"\nرولات ألوان أعلى لا أقدر أزيلها: {locked}"
+                if move_warning:
+                    note += f"\n{move_warning}"
+                await interaction.response.send_message(note, ephemeral=True)
+                return
+
+            done_msg = f"تم تغيير لونك إلى: {selected_label}"
+            if move_warning:
+                done_msg += f"\n{move_warning}"
+            await interaction.response.send_message(done_msg, ephemeral=True)
+
+        btn.callback = on_click
+        view.add_item(btn)
+
+    clear_btn = discord.ui.Button(
+        style=discord.ButtonStyle.danger,
+        emoji="🚫",
+        label="إزالة اللون",
+        custom_id=f"pick-color-clear:{guild_id}",
+        row=max(0, (len(role_entries) - 1) // 5 + 1),
+    )
+
+    async def on_clear(interaction: discord.Interaction):
+        if not interaction.guild or interaction.guild.id != guild_id:
+            await interaction.response.send_message("هذه اللوحة لا تخص هذا السيرفر.", ephemeral=True)
+            return
+
+        member = interaction.guild.get_member(interaction.user.id)
+        if member is None:
+            await interaction.response.send_message("لم أستطع العثور على العضو.", ephemeral=True)
+            return
+
+        bot_member = interaction.guild.me
+        remove_roles = []
+        blocked_roles = []
+        for r in member.roles:
+            if r.is_default() or r.colour.value == 0:
+                continue
+            if bot_member and r.position < bot_member.top_role.position and not r.managed:
+                remove_roles.append(r)
+            else:
+                blocked_roles.append(r)
+
+        if not remove_roles:
+            if blocked_roles:
+                names = ", ".join(r.name for r in blocked_roles[:3])
+                await interaction.response.send_message(
+                    f"لا أقدر إزالة الألوان لأن في رتب أعلى من البوت: {names}",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message("ما عندك لون مضاف حالياً.", ephemeral=True)
+            return
+
+        try:
+            await member.remove_roles(*remove_roles, reason="Clear color role")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "لا أملك صلاحية تعديل الرتب. تأكد أن رتبة البوت أعلى من رتب الألوان.",
+                ephemeral=True,
+            )
+            return
+        except Exception as e:
+            await interaction.response.send_message(f"فشل إزالة اللون: {e}", ephemeral=True)
+            return
+
+        await interaction.response.send_message("تمت إزالة اللون بنجاح.", ephemeral=True)
+
+    clear_btn.callback = on_clear
+    view.add_item(clear_btn)
+
+    return view
 
 
 def is_image_attachment(attachment: discord.Attachment) -> bool:
@@ -1147,6 +1380,201 @@ class ControlPanelView(discord.ui.View):
                         )
 
                 await inter.response.send_modal(ServerIDModal(inter.user.id))
+
+            @discord.ui.button(label="اختر لونك | Choose Color", style=discord.ButtonStyle.primary)
+            async def color_picker_setup(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild:
+                    await inter.response.send_message("Server only.", ephemeral=True)
+                    return
+
+                is_owner = inter.user.id == inter.guild.owner_id
+                conn = get_conn()
+                try:
+                    is_admin = conn.execute(
+                        "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
+                        (inter.guild.id, inter.user.id),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+                if not is_owner and not is_admin:
+                    await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+                    return
+
+                class ColorChannelSelect(discord.ui.ChannelSelect):
+                    async def callback(self, select_inter: discord.Interaction) -> None:
+                        selected_ref = self.values[0] if self.values else None
+                        if not selected_ref:
+                            await select_inter.response.send_message("No channel selected.", ephemeral=True)
+                            return
+
+                        await select_inter.response.defer(ephemeral=True, thinking=True)
+
+                        try:
+                            role_entries = await ensure_color_roles(select_inter.guild)
+                        except Exception as e:
+                            await select_inter.followup.send(f"فشل إنشاء رتب الألوان: {e}", ephemeral=True)
+                            return
+
+                        channel_id = selected_ref.id
+                        selected_channel = select_inter.guild.get_channel(channel_id)
+                        if selected_channel is None:
+                            try:
+                                fetched = await select_inter.guild.fetch_channel(channel_id)
+                                selected_channel = fetched if isinstance(fetched, discord.TextChannel) else None
+                            except Exception:
+                                selected_channel = None
+
+                        if selected_channel is None:
+                            await select_inter.followup.send(
+                                "تعذّر الوصول للقناة المختارة. اختر قناة نصية أخرى.",
+                                ephemeral=True,
+                            )
+                            return
+
+                        view = build_color_picker_view(select_inter.guild.id, role_entries)
+                        try:
+                            await selected_channel.send(
+                                "🎨 اختر لون اسمك بالضغط على الدائرة المناسبة:",
+                                view=view,
+                            )
+                        except discord.Forbidden:
+                            await select_inter.followup.send(
+                                "لا أملك صلاحية الإرسال في القناة المختارة.",
+                                ephemeral=True,
+                            )
+                            return
+                        except Exception as e:
+                            await select_inter.followup.send(
+                                f"فشل نشر لوحة الألوان: {e}",
+                                ephemeral=True,
+                            )
+                            return
+
+                        await select_inter.followup.send(
+                            f"تم نشر لوحة اختيار الألوان في {selected_channel.mention}",
+                            ephemeral=True,
+                        )
+
+                class ColorChannelSelectView(discord.ui.View):
+                    def __init__(self):
+                        super().__init__(timeout=300)
+                        self.add_item(
+                            ColorChannelSelect(
+                                placeholder="اختر القناة لنشر لوحة الألوان",
+                                channel_types=[discord.ChannelType.text],
+                                min_values=1,
+                                max_values=1,
+                            )
+                        )
+
+                await inter.response.send_message(
+                    "اختر القناة التي تريد نشر لوحة الألوان فيها:",
+                    view=ColorChannelSelectView(),
+                    ephemeral=True,
+                )
+
+            @discord.ui.button(label="إضافة لون | Add Color", style=discord.ButtonStyle.secondary)
+            async def add_color(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                if not inter.guild:
+                    await inter.response.send_message("Server only.", ephemeral=True)
+                    return
+
+                is_owner = inter.user.id == inter.guild.owner_id
+                conn = get_conn()
+                try:
+                    is_admin = conn.execute(
+                        "SELECT 1 FROM admins WHERE guild_id = ? AND user_id = ?",
+                        (inter.guild.id, inter.user.id),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+                if not is_owner and not is_admin:
+                    await inter.response.send_message("Admins only. | للمشرفين فقط.", ephemeral=True)
+                    return
+
+                class AddColorModal(discord.ui.Modal, title="إضافة لون جديد"):
+                    def __init__(self):
+                        super().__init__(timeout=300)
+                        self.label_input = discord.ui.TextInput(
+                            label="اسم اللون",
+                            placeholder="مثال: سماوي",
+                            max_length=30,
+                        )
+                        self.hex_input = discord.ui.TextInput(
+                            label="HEX اللون",
+                            placeholder="#00BFFF",
+                            max_length=7,
+                        )
+                        self.emoji_input = discord.ui.TextInput(
+                            label="إيموجي (اختياري)",
+                            placeholder="🔹",
+                            required=False,
+                            max_length=2,
+                        )
+                        self.add_item(self.label_input)
+                        self.add_item(self.hex_input)
+                        self.add_item(self.emoji_input)
+
+                    async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                        label = self.label_input.value.strip()
+                        hex_raw = self.hex_input.value.strip().lstrip("#").upper()
+                        emoji = (self.emoji_input.value or "").strip() or "⚪"
+
+                        if not re.fullmatch(r"[0-9A-F]{6}", hex_raw):
+                            await modal_inter.response.send_message(
+                                "صيغة HEX غير صحيحة. مثال صحيح: #00BFFF",
+                                ephemeral=True,
+                            )
+                            return
+
+                        await modal_inter.response.defer(ephemeral=True, thinking=True)
+
+                        conn2 = get_conn()
+                        try:
+                            existing = conn2.execute(
+                                "SELECT role_id FROM color_roles WHERE guild_id = ? AND color_hex = ?",
+                                (modal_inter.guild.id, hex_raw),
+                            ).fetchone()
+                            if existing and modal_inter.guild.get_role(existing["role_id"]):
+                                await modal_inter.followup.send(
+                                    "هذا اللون موجود مسبقًا.",
+                                    ephemeral=True,
+                                )
+                                return
+
+                            role = await modal_inter.guild.create_role(
+                                name=f"Color | {label}",
+                                colour=discord.Colour(int(hex_raw, 16)),
+                                mentionable=False,
+                                reason="Add custom color role",
+                            )
+
+                            bot_member = modal_inter.guild.me
+                            if bot_member and bot_member.top_role.position > 1:
+                                try:
+                                    await role.edit(position=bot_member.top_role.position - 1)
+                                except Exception:
+                                    pass
+
+                            conn2.execute(
+                                """
+                                INSERT INTO color_roles (guild_id, role_id, color_hex, label, emoji)
+                                VALUES (?, ?, ?, ?, ?)
+                                """,
+                                (modal_inter.guild.id, role.id, hex_raw, label, emoji),
+                            )
+                            conn2.commit()
+                        finally:
+                            conn2.close()
+
+                        await modal_inter.followup.send(
+                            f"تمت إضافة اللون {emoji} {label} بنجاح. أعد نشر لوحة الألوان من زر اختر لونك.",
+                            ephemeral=True,
+                        )
+
+                await inter.response.send_modal(AddColorModal())
 
         await interaction.response.send_message("Server Settings:", view=SettingsView(interaction.user.id, interaction.guild.id), ephemeral=True)
 
