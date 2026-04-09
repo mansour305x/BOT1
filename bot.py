@@ -965,12 +965,91 @@ class EditScheduleModal(discord.ui.Modal, title="Edit Reminder Schedule"):
                     ),
                 )
                 conn.commit()
+
+                current_row = conn.execute(
+                    "SELECT channel_id FROM events WHERE id = ? AND creator_id = ?",
+                    (self.event_id, inter.user.id),
+                ).fetchone()
+                current_channel_id = current_row["channel_id"] if current_row else None
             finally:
                 conn.close()
 
+            if not inter.guild:
+                await inter.response.edit_message(
+                    content="تم تحديث الوقت والأيام وإعدادات التذكير بنجاح.",
+                    view=None,
+                )
+                return
+
+            text_channels = sorted(inter.guild.text_channels, key=lambda c: c.position)
+
+            class ScheduleChannelSelect(discord.ui.Select):
+                def __init__(self):
+                    options = [
+                        discord.SelectOption(
+                            label="Keep current channel | نفس القناة الحالية",
+                            value="keep",
+                        ),
+                        discord.SelectOption(
+                            label="Use server default channel | القناة الافتراضية",
+                            value="default",
+                        ),
+                    ]
+                    options.extend(
+                        discord.SelectOption(label=f"#{ch.name}"[:100], value=str(ch.id))
+                        for ch in text_channels[:23]
+                    )
+                    super().__init__(
+                        placeholder="اختياري: اختر قناة هذا التذكير",
+                        options=options,
+                        min_values=1,
+                        max_values=1,
+                    )
+
+                async def callback(self, select_inter: discord.Interaction) -> None:
+                    if select_inter.user.id != inter.user.id:
+                        await select_inter.response.send_message("Not for you.", ephemeral=True)
+                        return
+
+                    selected = self.values[0]
+                    if selected == "keep":
+                        new_channel_id = current_channel_id
+                    elif selected == "default":
+                        new_channel_id = None
+                    else:
+                        new_channel_id = int(selected)
+
+                    conn2 = get_conn()
+                    try:
+                        conn2.execute(
+                            "UPDATE events SET channel_id = ? WHERE id = ? AND creator_id = ?",
+                            (new_channel_id, self.view.event_id, select_inter.user.id),
+                        )
+                        conn2.commit()
+                    finally:
+                        conn2.close()
+
+                    channel_text = f"<#{new_channel_id}>" if new_channel_id else "Default"
+                    await select_inter.response.edit_message(
+                        content=(
+                            "تم تحديث الوقت والأيام وإعدادات التذكير بنجاح.\n"
+                            f"Channel: {channel_text}"
+                        ),
+                        view=None,
+                    )
+
+            class ScheduleChannelSelectView(discord.ui.View):
+                def __init__(self, event_id: int):
+                    super().__init__(timeout=300)
+                    self.event_id = event_id
+                    self.add_item(ScheduleChannelSelect())
+
             await inter.response.edit_message(
-                content="تم تحديث الوقت والأيام وإعدادات التذكير بنجاح.",
-                view=None,
+                content=(
+                    "تم تحديث الوقت والأيام بنجاح.\n"
+                    "اختياريًا: اختر القناة لهذا التذكير أو اتركها كما هي."
+                ),
+                view=ScheduleChannelSelectView(self.event_id),
             )
 
         await interaction.response.send_message(
