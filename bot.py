@@ -2782,22 +2782,10 @@ class MainPanelView(discord.ui.View):
                     return False
                 return True
 
-            @discord.ui.button(label="تعديل الوقت والأيام | Time", style=discord.ButtonStyle.primary)
-            async def edit_time_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
-                await inter.response.send_modal(
-                    EditScheduleModal(
-                        event_id=self.event_row["id"],
-                        current_title=self.event_row["title"],
-                        current_time=self.event_row["time"],
-                        current_days=self.event_row["days"],
-                        current_remind_before=int(self.event_row["remind_before_minutes"]),
-                    )
-                )
-
-            @discord.ui.button(label="تعديل الرسالة | Message", style=discord.ButtonStyle.success)
+            @discord.ui.button(label="📝 تعديل الرسالة | Message", style=discord.ButtonStyle.success)
             async def edit_message_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
                 await inter.response.send_modal(
-                    EditMessageModal(self.event_row["id"], self.event_row["message"])
+                    EditMessageModal(self.event_row["id"], self.event_row.get("message"))
                 )
 
             @discord.ui.button(label="رفع صورة | Image", style=discord.ButtonStyle.secondary)
@@ -3087,11 +3075,217 @@ class MainPanelView(discord.ui.View):
         )
 
 
+class PanelHomeView(discord.ui.View):
+    """الشاشة الرئيسية للوحة التحكم"""
+    def __init__(self, owner_id: int, guild_id: int):
+        super().__init__(timeout=600)
+        self.owner_id = owner_id
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("ليس لديك صلاحية.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="📋 التذكيرات | Reminders", style=discord.ButtonStyle.primary)
+    async def reminders_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            "التذكيرات:",
+            view=MainPanelView(owner_id=self.owner_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="⚙️ الإعدادات | Settings", style=discord.ButtonStyle.secondary)
+    async def settings_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        class SettingsPanelView(discord.ui.View):
+            def __init__(self, owner_id: int, guild_id: int):
+                super().__init__(timeout=600)
+                self.owner_id = owner_id
+                self.guild_id = guild_id
+
+            async def interaction_check(self, inter: discord.Interaction) -> bool:
+                if inter.user.id != self.owner_id:
+                    await inter.response.send_message("ليس لديك صلاحية.", ephemeral=True)
+                    return False
+                return True
+
+            @discord.ui.button(label="👥 المشرفين | Admins", style=discord.ButtonStyle.primary)
+            async def admins_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                conn = get_conn()
+                try:
+                    admins = conn.execute(
+                        "SELECT admin_user_id FROM admins WHERE guild_id = ?",
+                        (self.guild_id,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+
+                if not admins:
+                    await inter.response.send_message(
+                        "لا توجد مشرفين مضافين.",
+                        ephemeral=True,
+                    )
+                    return
+
+                admin_list = "\n".join(f"• <@{a['admin_user_id']}>" for a in admins[:20])
+                class ManageAdminsView(discord.ui.View):
+                    def __init__(self, owner_id: int, guild_id: int):
+                        super().__init__(timeout=300)
+                        self.owner_id = owner_id
+                        self.guild_id = guild_id
+
+                    @discord.ui.button(label="➕ إضافة | Add", style=discord.ButtonStyle.success)
+                    async def add_admin(self, add_inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                        class PickUserModal(discord.ui.Modal, title="أدخل معرف المشرف"):
+                            admin_id_input = discord.ui.TextInput(label="معرف المشرف (User ID)", max_length=20)
+
+                            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                                try:
+                                    admin_id = int(self.admin_id_input.value)
+                                    conn = get_conn()
+                                    try:
+                                        conn.execute(
+                                            "INSERT OR IGNORE INTO admins (guild_id, admin_user_id) VALUES (?, ?)",
+                                            (self.guild_id, admin_id),
+                                        )
+                                        conn.commit()
+                                    finally:
+                                        conn.close()
+                                    await modal_inter.response.send_message(
+                                        f"✅ تم إضافة <@{admin_id}> كمشرف.",
+                                        ephemeral=True,
+                                    )
+                                except ValueError:
+                                    await modal_inter.response.send_message(
+                                        "معرف غير صحيح.",
+                                        ephemeral=True,
+                                    )
+
+                        await add_inter.response.send_modal(PickUserModal())
+
+                    @discord.ui.button(label="❌ حذف | Remove", style=discord.ButtonStyle.danger)
+                    async def remove_admin(self, remove_inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                        class PickUserModal(discord.ui.Modal, title="أدخل معرف المشرف للحذف"):
+                            admin_id_input = discord.ui.TextInput(label="معرف المشرف (User ID)", max_length=20)
+
+                            async def on_submit(self, modal_inter: discord.Interaction) -> None:
+                                try:
+                                    admin_id = int(self.admin_id_input.value)
+                                    conn = get_conn()
+                                    try:
+                                        conn.execute(
+                                            "DELETE FROM admins WHERE guild_id = ? AND admin_user_id = ?",
+                                            (self.guild_id, admin_id),
+                                        )
+                                        conn.commit()
+                                    finally:
+                                        conn.close()
+                                    await modal_inter.response.send_message(
+                                        f"✅ تم حذف المشرف.",
+                                        ephemeral=True,
+                                    )
+                                except ValueError:
+                                    await modal_inter.response.send_message(
+                                        "معرف غير صحيح.",
+                                        ephemeral=True,
+                                    )
+
+                        await remove_inter.response.send_modal(PickUserModal())
+
+                await inter.response.send_message(
+                    f"المشرفين ({len(admins)}):\n{admin_list}",
+                    view=ManageAdminsView(self.owner_id, self.guild_id),
+                    ephemeral=True,
+                )
+
+            @discord.ui.button(label="📢 قناة التذكيرات | Channel", style=discord.ButtonStyle.secondary)
+            async def channel_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                conn = get_conn()
+                try:
+                    settings = conn.execute(
+                        "SELECT notification_channel_id FROM server_settings WHERE guild_id = ?",
+                        (self.guild_id,),
+                    ).fetchone()
+                finally:
+                    conn.close()
+
+                channel_id = settings["notification_channel_id"] if settings else None
+                channel_text = f"<#{channel_id}>" if channel_id else "لم تُحدد"
+
+                await inter.response.send_message(
+                    f"📢 قناة التذكيرات: {channel_text}",
+                    ephemeral=True,
+                )
+
+            @discord.ui.button(label="🔄 رجوع | Back", style=discord.ButtonStyle.secondary)
+            async def back_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+                await inter.response.edit_message(
+                    content="اختر:",
+                    view=PanelHomeView(self.owner_id, self.guild_id),
+                )
+
+        await interaction.response.send_message(
+            "الإعدادات:",
+            view=SettingsPanelView(self.owner_id, self.guild_id),
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="panel", description="Open control panel | فتح لوحة التحكم")
 async def panel(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("Server only.", ephemeral=True)
+        return
+
     await interaction.response.send_message(
-        "Main Panel | اللوحة الرئيسية",
-        view=MainPanelView(owner_id=interaction.user.id),
+        "🎮 لوحة التحكم",
+        view=PanelHomeView(owner_id=interaction.user.id, guild_id=interaction.guild.id),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="owner_settings", description="Bot owner settings | إعدادات البوت للمالك")
+async def owner_settings(interaction: discord.Interaction) -> None:
+    """إعدادات خاصة بمالك البوت فقط"""
+    if interaction.user.id != BOT_OWNER_ID:
+        await interaction.response.send_message(
+            "هذا الأمر خاص بمالك البوت فقط.",
+            ephemeral=True,
+        )
+        return
+
+    class OwnerSettingsView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=600)
+
+        @discord.ui.button(label="ℹ️ عن البوت | About", style=discord.ButtonStyle.primary)
+        async def about_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+            embed = discord.Embed(
+                title="🤖 عن البوت",
+                description="بوت التذكيرات المتقدم",
+                color=discord.Color.gold(),
+            )
+            embed.add_field(name="👤 صانع البوت", value="DANGER TNT", inline=False)
+            embed.add_field(name="🆔 معرّف الديسكورد", value="DANGER_600", inline=False)
+            embed.add_field(name="🌐 الريبو", value="[BOT1](https://github.com/mansour305x/BOT1)", inline=False)
+            embed.add_field(name="✨ الميزات", value="تذكيرات متقدمة، دعم عربي، إعدادات مرنة", inline=False)
+            
+            await inter.response.send_message(embed=embed, ephemeral=True)
+
+        @discord.ui.button(label="📞 التواصل | Contact", style=discord.ButtonStyle.secondary)
+        async def contact_btn(self, inter: discord.Interaction, btn: discord.ui.Button) -> None:
+            await inter.response.send_message(
+                "📞 **للتواصل مع الدعم:**\n"
+                "🔗 Mention: <@DANGER_600>\n"
+                "💬 Discord: DANGER_600\n\n"
+                "سيتم الرد عليك قريباً!",
+                ephemeral=True,
+            )
+
+    await interaction.response.send_message(
+        "⚙️ إعدادات البوت",
+        view=OwnerSettingsView(),
         ephemeral=True,
     )
 
